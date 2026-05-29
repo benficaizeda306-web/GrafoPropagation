@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grafopropagation"
+version = "0.26.0"
+description = "GrafoPropagation v26-APEX — Geometric von Mises-Fisher Networks with WordNet Pre-training"
+readme = "README.md"
+license = {text = "Proprietary — see LICENSE file"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Claudio Fernandes"},
+]
+keywords = [
+    "deep-learning",
+    "transformer",
+    "von-mises-fisher",
+    "geometric-attention",
+    "wordnet",
+    "text-classification",
+    "mcts",
+    "riemannian",
+    "quantum",
+    "pennylane",
+    "rope",
+    "swiglu",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "pennylane>=0.33",
+    "pennylane-lightning>=0.33",
+    "datasets>=2.14",
+    "tokenizers>=0.14",
+    "nltk>=3.8",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "pennylane-lightning-gpu>=0.33",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+    "build>=0.10",
+    "twine>=4.0",
+]
+
+[project.scripts]
+grafoprop-train = "grafopropagation.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/claudiofernandes/grafopropagation"
+Repository = "https://github.com/claudiofernandes/grafopropagation"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+grafopropagation = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
