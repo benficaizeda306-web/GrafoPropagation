@@ -1,12 +1,15 @@
 # GrafoPropagation v26-APEX
 
-**Status:** Proprietary / Confidential
-**Author:** Claudio Fernandes
-**License:** Proprietary — see [LICENSE](LICENSE)
+**Status:** Proprietary / Confidential  
+**Author:** Claudio Fernandes  
+**License:** Proprietary — see [LICENSE](LICENSE)  
+**📖 Paper on Zenodo:** https://zenodo.org/records/20446506
 
 ## Overview
 
 GrafoPropagation is a compact (~990k parameter) text classification architecture built on **geometric von Mises-Fisher (vMF) attention** with **WordNet dictionary pre-training** and **AG News fine-tuning**.
+
+For detailed methodology, cite: [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20446506.svg)](https://doi.org/10.5281/zenodo.20446506)
 
 ### Key Innovations
 
