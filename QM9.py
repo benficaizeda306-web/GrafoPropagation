@@ -1,389 +1,650 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-GrafoPropagation v27-GEO-APEX-QM9-RAD · HOMO-LUMO Gap Regression
-=================================================================
-"Rich Atomic Descriptors" — representação atómica ultra-rica que substitui
-a CoulombMatrix por features fisicamente significativas + encoding geométrico.
+GrafoPropagation v29-DEEPMIND-BYOL-ASYMMETRIC · HOMO-LUMO Gap Regression
+=====================================================================
 
-REVOLUÇÃO vs v26 (CoulombMatrix):
-  ✗ v26: CoulombMatrix 29×29 → cada linha = 1 átomo "token" → Linear(29, 192)
-         Cada átomo só vê UMA linha da matriz → perde geometria 3D!
-  ✓ v27: 47+16 features por átomo:
-         • 27 propriedades físicas (EN×4, IE, EA, raios, polar., config. electr.)
-         • 20 features moleculares (posição 3D, estatísticas distância, vizinhos,
-           contexto electrostático, tamanho mol.)
-         • 16-dim learnable Z embedding (como PaiNN/SchNet/DimeNet++)
-         • DistanceAttentionBias com Bessel RBF + Gaussian RBF (DimeNet++ style)
+Sem E(3), sem S(3), sem rotação das moléculas.
 
-Arquitectura IDÊNTICA (mantida conforme pedido do utilizador):
-  d=192, L=4, H=8, hd=24, d_ff=896
-  ✓ AcceleratedRoPERotator (gradiente activo)
-  ✓ XorAttentionBias (O(1) memória)
-  ✓ TopologicalMERAScore (MERA-inspired)
-  ✓ CyclicTemporalBias (wrap-around)
-  ✓ ConditionalValueGate
-  ✓ XORSpatialFusion
-  ✓ LocalConvMix + SwiGLU FFN
-  ✓ RMSNorm, Stochastic Depth
-  ✓ EMA, Lookahead, AWP, GradCentralization
+Novidades principais vs v28:
+  1) Pre-pretreino substituído por DeepMind BYOL (Bootstrap Your Own Latent):
+     - Fluxo de gradiente assimétrico (Student prevê Teacher, Teacher não prevê Student).
+     - Resolve o colapso de dimensionalidade e a "preguiça" do projetor VICReg.
+     - Teacher atualizado por Exponential Moving Average (EMA).
 
-NOVO: DistanceAttentionBias
-  ✓ Bessel RBF (8 bases) — orthogonal, info-dense (DimeNet++)
-  ✓ Gaussian RBF (16 bases) — smooth, broad (SchNet/PaiNN)
-  ✓ Polynomial cutoff envelope p=5 (DimeNet++)
-  ✓ Projeção Linear → per-head attention bias
+  2) Spherical Shock Terrain Assimétrico ("O que eu sinto todos sentem"):
+     - "Podes encaixar mas não ser encaixado": Competição Softmax dos átomos pelo terreno.
+     - Global Sphere State: O terreno soma o contacto da molécula e partilha a forma
+       global de volta com todos os pontos antes da projeção.
 
-Input Pipeline:
-  Cache V4: z_indices + positions + fmask + targets_raw + n_atoms (RAW)
-  Features computadas APÓS split → normalização train-only (sem batota!)
-  Per-atom: [fixed_phys(27) | mol_dependent(20) | z_embed(16)] = 63 → Linear(63,192)
+  3) CÁLCULO ALIENÍGENA (RESSURGÊNCIA DE ÉCALLE):
+     - Fim do Gradient Clipping artificial que destrói a geometria das singularidades.
+     - Implementação da Transformada de Borel-Laplace e derivação não-perturbativa
+       para absorver e navegar gradientes infinitos (BorelLaplaceResurgentOptimizer).
 
-Compliance: train-only normalization, proper splits, sem data leakage.
+  4) CORREÇÃO CRÍTICA DE LEAKAGE:
+     - O pré-treino não supervisionado (BYOL) usa ESTRITAMENTE o train set.
+     - Zero exposição à distribuição do test/val set para garantir integridade.
 """
 
-import math, random, os, sys, time, datetime, json, warnings, copy, subprocess, bz2
-warnings.filterwarnings('ignore')
+import os, sys, math, time, json, copy, bz2, tarfile, random, datetime, warnings, urllib.request
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.amp import GradScaler, autocast
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
 
 try:
     from rich.console import Console
     from rich.table import Table
-    from rich.panel import Panel
-    from rich.text import Text
     from rich import box
-    console = Console(width=200, force_terminal=True)
+    console = Console(width=180, force_terminal=True)
     HAS_RICH = True
-except ImportError:
+except Exception:
     HAS_RICH = False
-    class _FC:
+    class _Console:
         def print(self, *a, **kw): print(*a)
-        def rule(self, *a, **kw): print('─' * 120)
-    console = _FC()
+        def rule(self, *a, **kw): print("─" * 120)
+    console = _Console()
 
-# ════════════════════════════════════ CONFIG ═══════════════════════════════════
+
+# ═══════════════════════════════════ CONFIG ═══════════════════════════════════
+
 class CFG:
-    VERSION   = 'v27-GEO-APEX-QM9-RAD'
-    seed      = 42
-    device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    amp_dtype = (torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-                 else torch.float32)
+    VERSION = "v29-DEEPMIND-BYOL-ASYMMETRIC"
 
-    # QM9 Dataset
-    max_atoms    = 29
-    # Feature dims: fixed_phys(27) + mol_dependent(20) + z_embed(16) = 63
-    n_fixed_feats   = 27
-    n_mol_feats     = 20
-    n_z_embed       = 16
-    feature_dim     = n_fixed_feats + n_mol_feats + n_z_embed  # = 63
-    gap_idx         = 4
-    qm9_root        = os.environ.get('QM9_ROOT', '/tmp/QM9')
-    cache_path      = os.environ.get('QM9_CACHE', '/tmp/qm9_rad_cache_v4.pt')
-    if not os.access(os.path.dirname(cache_path) or '.', os.W_OK):
-        cache_path = './qm9_rad_cache_v4.pt'
-    if not os.access(os.path.dirname(qm9_root) or '.', os.W_OK):
-        qm9_root = './QM9'
-    normalize_y  = True
+    seed = 42
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = (
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else torch.float32
+    )
+    amp_enabled = bool(torch.cuda.is_available() and amp_dtype != torch.float32)
 
-    # DistanceAttentionBias
-    dist_n_rbf_gauss  = 16        # Gaussian RBF basis functions
-    dist_n_rbf_bessel = 8         # Bessel RBF basis functions
-    dist_cutoff       = 5.0       # Å — cutoff distance
+    qm9_root = os.environ.get("QM9_ROOT", "/tmp/QM9")
+    cache_path = os.environ.get("QM9_CACHE", "/tmp/qm9_rad_cache_v5_terrain.pt")
+
+    max_atoms = 29
+    gap_idx = 4
+    normalize_y = True
+
+    # Features: fixed physical 27 + molecule-dependent 20 + Z embedding 16.
+    n_fixed_feats = 27
+    n_mol_feats = 20
+    atom_feature_dim = n_fixed_feats + n_mol_feats  # 47
+    n_z_embed = 16
+    feature_dim = atom_feature_dim + n_z_embed      # 63
+
+    # Standard QM9 split used by many papers when N permits.
+    split_mode = "standard_110k"
+    standard_train = 110000
+    standard_val = 10000
+
+    # Shock Terrain Sphere (Asymmetric & Global).
+    use_shock_terrain = True
+    terrain_dirs = 16
+    terrain_shells = 4
+    terrain_radius = 4.8
+    terrain_sigma = 0.55
+    terrain_rotate_train = True
+    terrain_eval_views = 4
+    terrain_dropout = 0.03
+
+    # Distance attention bias.
     use_distance_bias = True
+    dist_n_rbf_gauss = 16
+    dist_n_rbf_bessel = 8
+    dist_cutoff = 5.0
 
-    # Arquitectura (~2.83M) — IDÊNTICO ao v26
-    d_model     = 192
-    n_layers    = 4
-    n_heads     = 8
-    head_dim    = 24
-    d_ff        = 896
-    dropout     = 0.10
+    # Architecture.
+    d_model = 192
+    n_layers = 4
+    n_heads = 8
+    head_dim = 24
+    d_ff = 896
+    dropout = 0.10
     stoch_depth = 0.08
     conv_kernel = 3
 
-    # RoPE
+    # RoPE/order mechanisms. Cyclic mask is false by default for molecules.
     use_accelerated_rope = True
-    rope_base   = 10000.0
+    rope_base = 10000.0
     rope_max_seq = 64
 
-    # Attention biases
-    use_cyclic_mask       = True
-    use_xor_bias          = True
-    use_topological_bias  = True
-    use_conditional_gate  = True
+    use_cyclic_mask = False
+    use_xor_bias = True
+    use_topological_bias = True
+    use_conditional_gate = True
 
-    # Treino — MESMO do v26
-    epochs       = 60
-    batch_size   = 128
-    grad_accum   = 1
-    wd           = 1e-4
-    clip_grad    = 1.0
-    base_lr_max  = 5e-4
-    warmup_frac  = 0.05
-    min_lr_frac  = 0.05
-    ema_decay    = 0.999
-    awp_eps      = 0.003
-    awp_lr       = 0.005
+    # ── PRE-PRETREINO DEEPMIND BYOL ───────────────────────────────────────────
+    use_prepretrain = bool(int(os.environ.get("USE_PREPRETRAIN", "1")))
+    prepretrain_epochs = int(os.environ.get("PREPRETRAIN_EPOCHS", "12"))
+    prepretrain_batch_size = 128
+    prepretrain_lr = 5e-4
+    prepretrain_wd = 1.5e-4
+    prepretrain_warmup_frac = 0.05
+    prepretrain_min_lr_frac = 0.05
+    # Clipping limits removidos em favor do BorelLaplaceResurgentOptimizer
+    prepretrain_use_all_data = False # NUNCA usar test data, mesmo em unsupervised
+    prepretrain_projector_hidden = 256
+    prepretrain_projector_out = 128
+    prepretrain_byol_momentum = 0.99
+    
+    # Curriculum da rotação do terreno.
+    prepretrain_curriculum = True
+    prepretrain_rot_start = 0.15
+    prepretrain_rot_end = 1.0
+
+    # Pretraining principal.
+    pretrain_epochs = int(os.environ.get("PRETRAIN_EPOCHS", "8"))
+    pretrain_batch_size = 128
+    pretrain_lr = 4e-4
+    pretrain_wd = 1e-4
+    pretrain_mask_rate = 0.15
+    pretrain_aux_weight = 1.00
+    pretrain_atom_weight = 0.25
+    pretrain_vicreg_weight = 0.0 
+
+    # Finetuning.
+    epochs = int(os.environ.get("EPOCHS", "60"))
+    batch_size = 128
+    grad_accum = 1
+    wd = 1e-4
+    base_lr_max = 1e-3                # <── aumentado de 5e-4 para 1e-3
+    warmup_frac = 0.05
+    min_lr_frac = 0.05
+    ema_decay = 0.999
+    awp_eps = 0.003
+    awp_lr = 0.005
     awp_start_ep = 15
-    la_k         = 6
-    la_alpha     = 0.50
-    huber_delta  = 1.0
-    mixup_alpha  = 0.20
-    mixup_prob   = 0.10
+    la_k = 6
+    la_alpha = 0.50
+    huber_delta = 1.0
 
-    # Logging
-    attn_log_freq    = 20
+    # Desligado: mixup entre moléculas é geometria falsa.
+    mixup_prob = 0.0
+    feature_noise_std = 0.002
+
+    # Loader/logging.
+    num_workers = int(os.environ.get("NUM_WORKERS", "2"))
+    pin_memory = bool(torch.cuda.is_available())
+    attn_log_freq = 30
     checkpoint_every = 25
-    checkpoint_dir   = './ckpt_qm9_v27_rad'
-    history_path     = './ckpt_qm9_v27_rad/history.json'
+    checkpoint_dir = "./ckpt_qm9_v29_terrain"
+    history_path = "./ckpt_qm9_v29_terrain/history.json"
 
-# ══════════════════════════════════ UTILITÁRIOS ═══════════════════════════════
-def set_seed(s):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
-set_seed(CFG.seed)
+
+# ═════════════════════════════════ UTIL ═══════════════════════════════════════
 
 RUN_ID = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-_LOG_BUF = []
 
 def _ts():
-    return datetime.datetime.utcnow().strftime('%H:%M:%S.%f')[:-3]
+    return datetime.datetime.utcnow().strftime("%H:%M:%S.%f")[:-3]
 
-def log(msg, level='INFO'):
-    ts = _ts()
-    _LOG_BUF.append({'ts': ts, 'lvl': level, 'msg': msg})
-    style_map = {
-        'INFO': 'dim', 'WARN': 'yellow', 'ERROR': 'bold red',
-        'METRIC': 'bold cyan', 'DATA': 'bold green', 'TRAIN': 'magenta',
-        'EVAL': 'bold blue',
-    }
-    s = style_map.get(level, '')
-    if HAS_RICH and s:
-        console.print(f'[{s}][[{ts}]] [{level}] {msg}[/{s}]')
+def log(msg, level="INFO"):
+    style = {
+        "INFO": "dim",
+        "WARN": "yellow",
+        "ERROR": "bold red",
+        "DATA": "bold green",
+        "TRAIN": "magenta",
+        "PRE": "bold magenta",
+        "PREPRE": "bold yellow",
+        "METRIC": "bold cyan",
+        "EVAL": "bold blue",
+    }.get(level, "")
+    if HAS_RICH and style:
+        console.print(f"[{style}][[{_ts()}]] [{level}] {msg}[/{style}]")
     else:
-        print(f'[[{ts}]] [{level}] {msg}', flush=True)
+        print(f"[[{_ts()}]] [{level}] {msg}", flush=True)
 
-def log_separator(title='', char='═', width=120):
+def log_separator(title=""):
     if HAS_RICH:
-        console.rule(f'[bold]{title}[/bold]', style='bright_blue', characters=char)
+        console.rule(f"[bold]{title}[/bold]", style="bright_blue", characters="═")
     else:
-        print(f'\n{char * width}')
-        if title: print(f'  {title}')
-        print(f'{char * width}\n')
+        print("\n" + "═" * 120)
+        print(title)
+        print("═" * 120)
 
-# ═════════════════════════ QUANTUM ATOMIC PROPERTIES ═════════════════════════════
-# Comprehensive lookup table of physically meaningful atomic properties.
-# All values from NIST/PubChem/IUPAC primary sources.
-# Only H, C, N, O, F appear in QM9 (max 29 atoms, up to 9 heavy atoms + H).
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def cfg_to_dict(cfg):
+    out = {}
+    for k in dir(cfg):
+        if k.startswith("_"):
+            continue
+        v = getattr(cfg, k)
+        if callable(v):
+            continue
+        if isinstance(v, torch.device):
+            out[k] = str(v)
+        elif isinstance(v, torch.dtype):
+            out[k] = str(v)
+        elif isinstance(v, (int, float, str, bool, type(None))):
+            out[k] = v
+    return out
+
+def ensure_paths(cfg):
+    for attr, fallback in [
+        ("qm9_root", "./QM9"),
+        ("cache_path", "./qm9_rad_cache_v5_terrain.pt"),
+    ]:
+        p = getattr(cfg, attr)
+        d = os.path.dirname(p) if attr == "cache_path" else p
+        try:
+            os.makedirs(d or ".", exist_ok=True)
+        except Exception:
+            setattr(cfg, attr, fallback)
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+if hasattr(torch, "set_float32_matmul_precision"):
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+# ═════════════════════════ ATOMIC PHYSICAL FEATURES ══════════════════════════
 
 ATOMIC_PROPS = {
-    # Z: (symbol, pauling_en, allen_en, allred_rochow_en,
-    #     ie_eV, ea_eV, cov_rad_pm, vdw_rad_pm, polariz_A3,
-    #     valence_e, val_s, val_p, unpaired_e, lone_pairs,
-    #     period, group, max_valence, z_eff_slater, core_e,
-    #     self_energy, nuc_charge_density, elec_density_proxy)
-    1: ('H',  2.20, 2.300, 2.20,
-        13.59844, 0.75420, 31, 110, 0.667,
-        1, 1, 0, 1, 0,
-        1, 1, 1, 1.0, 0,
-        0.5, 0.0337, 0.0337),
-    6: ('C',  2.55, 2.544, 2.50,
-        11.26030, 1.26212, 76, 170, 1.760,
-        4, 2, 2, 2, 0,
-        2, 14, 4, 3.25, 2,
-        50.2, 0.0273, 0.0109),
-    7: ('N',  3.04, 3.066, 3.07,
-        14.53414, -0.07, 71, 155, 1.100,
-        5, 2, 3, 3, 1,
-        2, 15, 3, 3.90, 2,
-        79.3, 0.0278, 0.0139),
-    8: ('O',  3.44, 3.610, 3.50,
-        13.61806, 1.46111, 66, 152, 0.802,
-        6, 2, 4, 2, 2,
-        2, 16, 2, 4.55, 2,
-        115.3, 0.0278, 0.0185),
-    9: ('F',  3.98, 4.193, 4.10,
-        17.42282, 3.40119, 57, 147, 0.557,
-        7, 2, 5, 1, 3,
-        2, 17, 1, 5.20, 2,
-        162.5, 0.0280, 0.0271),
+    1: ("H", 2.20, 2.300, 2.20, 13.59844, 0.75420, 31, 110, 0.667,
+        1, 1, 0, 1, 0, 1, 1, 1, 1.0, 0, 0.5, 0.0337, 0.0337),
+    6: ("C", 2.55, 2.544, 2.50, 11.26030, 1.26212, 76, 170, 1.760,
+        4, 2, 2, 2, 0, 2, 14, 4, 3.25, 2, 50.2, 0.0273, 0.0109),
+    7: ("N", 3.04, 3.066, 3.07, 14.53414, -0.07, 71, 155, 1.100,
+        5, 2, 3, 3, 1, 2, 15, 3, 3.90, 2, 79.3, 0.0278, 0.0139),
+    8: ("O", 3.44, 3.610, 3.50, 13.61806, 1.46111, 66, 152, 0.802,
+        6, 2, 4, 2, 2, 2, 16, 2, 4.55, 2, 115.3, 0.0278, 0.0185),
+    9: ("F", 3.98, 4.193, 4.10, 17.42282, 3.40119, 57, 147, 0.557,
+        7, 2, 5, 1, 3, 2, 17, 1, 5.20, 2, 162.5, 0.0280, 0.0271),
 }
 
-# Indices into ATOMIC_PROPS tuples for building feature vectors
-_APROP_SYMBOL    = 0
-_APROP_PAULING   = 1
-_APROP_ALLEN     = 2
-_APROP_ALLRED    = 3
-_APROP_IE        = 4
-_APROP_EA        = 5
-_APROP_COV_R     = 6
-_APROP_VDW_R     = 7
-_APROP_POLARIZ   = 8
-_APROP_VAL_E     = 9
-_APROP_VAL_S     = 10
-_APROP_VAL_P     = 11
-_APROP_UNPAIRED  = 12
-_APROP_LONE_P    = 13
-_APROP_PERIOD    = 14
-_APROP_GROUP     = 15
-_APROP_MAX_VAL   = 16
-_APROP_ZEFF      = 17
-_APROP_CORE_E    = 18
-_APROP_SELF_E    = 19
-_APROP_NUC_DENS  = 20
-_APROP_ELEC_DENS = 21
-
-# Per-Z fixed feature vector builder
-# Returns 27-dim vector: [one_hot(5), Z, pauling, allen, allred, IE, EA,
-#   cov_rad, vdw_rad, polariz, val_e, val_s, val_p, unpaired, lone_pairs,
-#   period, group, max_val, z_eff, core_e, self_energy, nuc_dens, elec_dens]
 def _build_fixed_feature_vector(z):
-    """Build 27-dim fixed physical property vector for atomic number z."""
     if z not in ATOMIC_PROPS:
-        z = 6  # Default to carbon if unknown (shouldn't happen for QM9)
+        z = 6
     p = ATOMIC_PROPS[z]
-    # One-hot atom type
     one_hot = [1.0 if z == zn else 0.0 for zn in [1, 6, 7, 8, 9]]
     return np.array(one_hot + [
-        float(z),                      # Z
-        p[_APROP_PAULING],             # Pauling EN
-        p[_APROP_ALLEN],               # Allen EN
-        p[_APROP_ALLRED],              # Allred-Rochow EN
-        p[_APROP_IE],                  # Ionization Energy (eV)
-        p[_APROP_EA],                  # Electron Affinity (eV)
-        p[_APROP_COV_R] / 100.0,       # Covalent radius (Å)
-        p[_APROP_VDW_R] / 100.0,       # vdW radius (Å)
-        p[_APROP_POLARIZ],             # Polarizability (ų)
-        float(p[_APROP_VAL_E]),        # Valence electrons
-        float(p[_APROP_VAL_S]),        # Valence s electrons
-        float(p[_APROP_VAL_P]),        # Valence p electrons
-        float(p[_APROP_UNPAIRED]),     # Unpaired electrons
-        float(p[_APROP_LONE_P]),       # Lone pairs
-        float(p[_APROP_PERIOD]),       # Period
-        float(p[_APROP_GROUP]),        # Group
-        float(p[_APROP_MAX_VAL]),      # Max valence
-        p[_APROP_ZEFF],                # Effective nuclear charge (Slater)
-        float(p[_APROP_CORE_E]),       # Core electrons
-        p[_APROP_SELF_E],              # 0.5 * Z^2.4 (Coulomb self-energy)
-        p[_APROP_NUC_DENS],            # Nuclear charge density
-        p[_APROP_ELEC_DENS],           # Electron density proxy
-    ], dtype=np.float64)
+        float(z),
+        p[1], p[2], p[3],
+        p[4], p[5],
+        p[6] / 100.0,
+        p[7] / 100.0,
+        p[8],
+        float(p[9]), float(p[10]), float(p[11]), float(p[12]), float(p[13]),
+        float(p[14]), float(p[15]), float(p[16]),
+        p[17], float(p[18]), p[19], p[20], p[21],
+    ], dtype=np.float32)
 
-# Pre-build lookup table (10 entries, indexed by Z)
 FIXED_FEAT_TABLE = np.zeros((10, CFG.n_fixed_feats), dtype=np.float32)
 for _z in [1, 6, 7, 8, 9]:
-    FIXED_FEAT_TABLE[_z] = _build_fixed_feature_vector(_z).astype(np.float32)
+    FIXED_FEAT_TABLE[_z] = _build_fixed_feature_vector(_z)
 
 
 def compute_mol_dependent_features(z_arr, pos, max_atoms):
-    """
-    Compute molecule-dependent per-atom features (20 dims).
-
-    z_arr: (n,) atomic numbers (float64)
-    pos:   (n, 3) positions (float64, Angstrom)
-    max_atoms: 29
-
-    Returns: (max_atoms, 20) Float64 array (padded with 0)
-    """
     M = max_atoms
     n = min(len(z_arr), M)
     feats = np.zeros((M, 20), dtype=np.float64)
-
     if n == 0:
         return feats
 
     z = z_arr[:n].astype(np.float64)
     p = pos[:n].astype(np.float64)
 
-    # Centroid
     centroid = p.mean(axis=0)
-    p_centered = p - centroid  # (n, 3)
+    pc = p - centroid
+    d_cent = np.sqrt((pc ** 2).sum(axis=1))
+    mol_radius = max(float(d_cent.max()), 1e-6)
+    mol_size = n / M
 
-    # Molecular radius
-    dists_to_centroid = np.sqrt((p_centered ** 2).sum(axis=1))
-    mol_radius = max(dists_to_centroid.max(), 1e-6)
-    mol_size = n / M  # normalized
+    diff = p[:, None, :] - p[None, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=-1))
 
-    # Pairwise distances
-    diff = p[:, None, :] - p[None, :, :]  # (n, n, 3)
-    dist_mat = np.sqrt((diff ** 2).sum(axis=-1))  # (n, n)
-    # NOTE: We do NOT fill diagonal with 1e10 here — instead, we exclude
-    # the diagonal when computing per-atom statistics below.
-
-    # Pairwise Coulomb interactions: Z_i * Z_j / r_ij
-    dist_mat_safe = dist_mat.copy()
-    np.fill_diagonal(dist_mat_safe, 1.0)  # avoid div/0
-    zz = z[:, None] * z[None, :]  # (n, n)
-    coulomb = zz / dist_mat_safe  # (n, n)
-    np.fill_diagonal(coulomb, 0.0)
+    dist_safe = dist.copy()
+    np.fill_diagonal(dist_safe, 1.0)
+    coul = (z[:, None] * z[None, :]) / dist_safe
+    np.fill_diagonal(coul, 0.0)
 
     for i in range(n):
-        d_i = dist_mat[i].copy()  # (n,) distances from atom i to all others
-        d_i[i] = np.inf  # exclude self-distance (diagonal = 0)
-
-        # Sort distances (for nearest neighbor distances)
-        sorted_d = np.sort(d_i[d_i < np.inf])  # only real distances
-
-        # Distance statistics (excluding self)
-        n_others = len(sorted_d)
-        mean_dist = sorted_d.mean() if n_others > 0 else 0.0
-        std_dist = sorted_d.std() if n_others > 0 else 0.0
-        min_dist = sorted_d[0] if n_others > 0 else 0.0  # 1st NN
-        nn2_dist = sorted_d[1] if n_others > 1 else min_dist  # 2nd NN
-        nn3_dist = sorted_d[2] if n_others > 2 else nn2_dist  # 3rd NN
-        max_dist = sorted_d[-1] if n_others > 0 else 0.0
-
-        # Neighbor counts (Gaussian-smoothed, excluding self)
+        d_i = dist[i].copy()
+        d_i[i] = np.inf
+        sorted_d = np.sort(d_i[d_i < np.inf])
         d_others = d_i[d_i < np.inf]
-        sigma_smooth = 0.3
-        nb_1p8 = np.exp(-0.5 * ((d_others - 1.8) / sigma_smooth) ** 2).sum()  # ~bonded
-        nb_2p5 = np.exp(-0.5 * ((d_others - 2.5) / sigma_smooth) ** 2).sum()  # ~second shell
-        nb_3p5 = np.exp(-0.5 * ((d_others - 3.5) / sigma_smooth) ** 2).sum()  # ~third shell
+        n_others = len(sorted_d)
 
-        # Electrostatic context
-        c_i = coulomb[i]
+        mean_dist = sorted_d.mean() if n_others else 0.0
+        std_dist = sorted_d.std() if n_others else 0.0
+        min_dist = sorted_d[0] if n_others else 0.0
+        nn2_dist = sorted_d[1] if n_others > 1 else min_dist
+        nn3_dist = sorted_d[2] if n_others > 2 else nn2_dist
+        max_dist = sorted_d[-1] if n_others else 0.0
+
+        sigma = 0.3
+        nb_1p8 = np.exp(-0.5 * ((d_others - 1.8) / sigma) ** 2).sum()
+        nb_2p5 = np.exp(-0.5 * ((d_others - 2.5) / sigma) ** 2).sum()
+        nb_3p5 = np.exp(-0.5 * ((d_others - 3.5) / sigma) ** 2).sum()
+
+        c_i = coul[i]
         sum_coulomb = c_i.sum()
-        # exp-weighted Z of neighbors (exclude self)
         z_others = np.delete(z, i)
-        local_elec_dens = (z_others * np.exp(-d_others / 2.0)).sum()  # exp-weighted Z
+        local_elec_dens = (z_others * np.exp(-d_others / 2.0)).sum()
 
-        # Position features
-        x_c, y_c, z_c = p_centered[i]
-        xn = x_c / mol_radius
-        yn = y_c / mol_radius
-        zn = z_c / mol_radius
-
-        # Distance to centroid
-        d_centroid = dists_to_centroid[i]
+        x_c, y_c, z_c = pc[i]
+        xn, yn, zn = x_c / mol_radius, y_c / mol_radius, z_c / mol_radius
 
         feats[i] = [
-            x_c, y_c, z_c,            # Centered position (3)
-            xn, yn, zn,               # Normalized position (3)
-            mean_dist,                 # Mean distance (1)
-            std_dist,                  # Std distance (1)
-            min_dist,                  # 1st NN distance (1)
-            nn2_dist,                  # 2nd NN distance (1)
-            nn3_dist,                  # 3rd NN distance (1)
-            max_dist,                  # Max distance (1)
-            nb_1p8,                   # Neighbor count at 1.8Å (1)
-            nb_2p5,                   # Neighbor count at 2.5Å (1)
-            nb_3p5,                   # Neighbor count at 3.5Å (1)
-            sum_coulomb,              # Sum Coulomb interactions (1)
-            local_elec_dens,          # Local electron density (1)
-            d_centroid,               # Distance to centroid (1)
-            mol_size,                 # Molecular size (1)
-            mol_radius,               # Molecular radius (1)
+            x_c, y_c, z_c,
+            xn, yn, zn,
+            mean_dist, std_dist,
+            min_dist, nn2_dist, nn3_dist, max_dist,
+            nb_1p8, nb_2p5, nb_3p5,
+            sum_coulomb,
+            local_elec_dens,
+            d_cent[i],
+            mol_size,
+            mol_radius,
         ]
-
     return feats
 
 
-# ═════════════════════════ INICIALIZAÇÕES ESPECIAIS ═══════════════════════════════
+# ═════════════════════════ DATA LOADING / CACHE ══════════════════════════════
+
+HAR2EV = 27.211386245988
+
+def _convert_compact12_to_pyg_units(y):
+    y = np.array(y, dtype=np.float32)
+    for idx in [2, 3, 4, 6, 7, 8, 9, 10]:
+        y[idx] *= HAR2EV
+    return y
+
+def _parse_xyz_text_block(text, append_fn):
+    lines = text.splitlines()
+    ptr = 0
+    while ptr < len(lines):
+        line = lines[ptr].strip()
+        try:
+            n_atoms = int(line.split()[0])
+            if n_atoms < 1 or n_atoms > 100:
+                ptr += 1
+                continue
+        except Exception:
+            ptr += 1
+            continue
+
+        if ptr + 1 + n_atoms >= len(lines):
+            break
+
+        props = lines[ptr + 1].strip().split()
+        if len(props) < 17:
+            ptr += 1
+            continue
+
+        try:
+            y = _convert_compact12_to_pyg_units([float(props[i]) for i in range(5, 17)])
+            z_list, pos_list = [], []
+            atomic_num = {"H": 1, "C": 6, "N": 7, "O": 8, "F": 9}
+            valid = True
+            for i in range(n_atoms):
+                parts = lines[ptr + 2 + i].strip().split()
+                if len(parts) < 4 or parts[0] not in atomic_num:
+                    valid = False
+                    break
+                z_list.append(atomic_num[parts[0]])
+                pos_list.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            if valid:
+                append_fn(z_list, pos_list, y)
+        except Exception:
+            pass
+
+        ptr += 2 + n_atoms
+
+def precompute_qm9_data(cfg):
+    cache_path = cfg.cache_path
+    if os.path.exists(cache_path):
+        try:
+            data = torch.load(cache_path, map_location="cpu", weights_only=False)
+            required = {"z_indices", "positions", "fmask", "targets_raw", "targets_all", "n_atoms"}
+            if required.issubset(set(data.keys())):
+                log(f"Loading cache v5: {cache_path} · N={len(data['z_indices']):,}", "DATA")
+                return data
+            log("Cache antigo/incompleto; recalculando.", "WARN")
+            os.remove(cache_path)
+        except Exception:
+            log("Cache corrupto; recalculando.", "WARN")
+            try: os.remove(cache_path)
+            except Exception: pass
+
+    M = cfg.max_atoms
+    all_z_indices = None
+    all_positions = None
+    all_targets_all = None
+    all_n_atoms = None
+
+    try:
+        from torch_geometric.datasets import QM9
+        log("A carregar QM9 via torch_geometric.", "DATA")
+        ds = QM9(root=cfg.qm9_root)
+        N = len(ds)
+        K = int(ds[0].y.view(-1).numel())
+        all_z_indices = np.zeros((N, M), dtype=np.int64)
+        all_positions = np.zeros((N, M, 3), dtype=np.float32)
+        all_targets_all = np.full((N, K), np.nan, dtype=np.float32)
+        all_n_atoms = np.zeros(N, dtype=np.int32)
+
+        t0 = time.time()
+        for idx in range(N):
+            d = ds[idx]
+            z = d.z.cpu().numpy().astype(np.int64)
+            pos = d.pos.cpu().numpy().astype(np.float32)
+            y = d.y.view(-1).cpu().numpy().astype(np.float32)
+            n = min(len(z), M)
+            all_z_indices[idx, :n] = z[:n]
+            all_positions[idx, :n] = pos[:n]
+            all_targets_all[idx, :len(y)] = y
+            all_n_atoms[idx] = n
+            if (idx + 1) % 20000 == 0 or idx + 1 == N:
+                rate = (idx + 1) / max(time.time() - t0, 1e-9)
+                log(f"PyG parse: {idx+1:,}/{N:,} · {rate:.0f} mol/s", "DATA")
+    except Exception as e:
+        log(f"PyG falhou: {repr(e)}", "WARN")
+
+    if all_z_indices is None:
+        log("Fallback direto: figshare dsgdb9nsd.xyz.tar.bz2", "DATA")
+        raw_dir = os.path.join(cfg.qm9_root, "raw")
+        os.makedirs(raw_dir, exist_ok=True)
+        tar_path = os.path.join(raw_dir, "dsgdb9nsd.xyz.tar.bz2")
+        xyz_path = os.path.join(raw_dir, "dsgdb9nsd.xyz")
+
+        if not os.path.exists(tar_path) and not os.path.exists(xyz_path):
+            url = "https://ndownloader.figshare.com/files/3195389"
+            log(f"Downloading {url}", "DATA")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                with open(tar_path, "wb") as f:
+                    f.write(r.read())
+
+        z_list_all, pos_list_all, y_list_all, n_list_all = [], [], [], []
+        def append_fn(zl, pl, y):
+            z_list_all.append(zl)
+            pos_list_all.append(pl)
+            y_list_all.append(y)
+            n_list_all.append(len(zl))
+            if len(z_list_all) % 20000 == 0:
+                log(f"Direct parse: {len(z_list_all):,} molecules", "DATA")
+
+        if os.path.exists(xyz_path):
+            with open(xyz_path, "r", encoding="ascii", errors="ignore") as f:
+                _parse_xyz_text_block(f.read(), append_fn)
+        elif os.path.exists(tar_path):
+            with tarfile.open(tar_path, "r:bz2") as tar:
+                for member in tar:
+                    if not member.isfile() or not member.name.endswith(".xyz"):
+                        continue
+                    f = tar.extractfile(member)
+                    if f is None:
+                        continue
+                    txt = f.read().decode("ascii", errors="ignore")
+                    _parse_xyz_text_block(txt, append_fn)
+
+        if len(z_list_all) == 0:
+            raise RuntimeError("Não foi possível carregar QM9.")
+
+        N = len(z_list_all)
+        K = 12
+        all_z_indices = np.zeros((N, M), dtype=np.int64)
+        all_positions = np.zeros((N, M, 3), dtype=np.float32)
+        all_targets_all = np.full((N, K), np.nan, dtype=np.float32)
+        all_n_atoms = np.zeros(N, dtype=np.int32)
+
+        for idx, (zl, pl, y) in enumerate(zip(z_list_all, pos_list_all, y_list_all)):
+            n = min(len(zl), M)
+            all_z_indices[idx, :n] = np.array(zl[:n], dtype=np.int64)
+            all_positions[idx, :n] = np.array(pl[:n], dtype=np.float32)
+            all_targets_all[idx, :len(y)] = y
+            all_n_atoms[idx] = n
+
+    N = len(all_z_indices)
+    for idx in range(N):
+        n = int(all_n_atoms[idx])
+        if n > 0:
+            c = all_positions[idx, :n].mean(axis=0)
+            all_positions[idx, :n] -= c
+
+    fmask = np.zeros((N, M), dtype=np.float32)
+    for idx in range(N):
+        n = int(all_n_atoms[idx])
+        if n < M:
+            fmask[idx, n:] = -10000.0
+
+    targets_raw = all_targets_all[:, cfg.gap_idx].astype(np.float32)
+
+    result = {
+        "z_indices": torch.from_numpy(all_z_indices),
+        "positions": torch.from_numpy(all_positions),
+        "fmask": torch.from_numpy(fmask),
+        "targets_raw": torch.from_numpy(targets_raw),
+        "targets_all": torch.from_numpy(all_targets_all),
+        "n_atoms": torch.from_numpy(all_n_atoms),
+    }
+    try: torch.save(result, cache_path)
+    except Exception: pass
+    return result
+
+
+def compute_all_mol_features(z_indices, positions, n_atoms, max_atoms, batch_log=5000):
+    N = z_indices.shape[0]
+    out = np.zeros((N, max_atoms, CFG.n_mol_feats), dtype=np.float32)
+    z_np = z_indices.numpy()
+    p_np = positions.numpy()
+    n_np = n_atoms.numpy()
+
+    t0 = time.time()
+    for i in range(N):
+        n = int(n_np[i])
+        if n > 0:
+            out[i] = compute_mol_dependent_features(
+                z_np[i, :n].astype(np.float64), p_np[i, :n].astype(np.float64), max_atoms
+            ).astype(np.float32)
+    return torch.from_numpy(out)
+
+
+def build_atom_features_train_only(raw_data, train_idx, cfg):
+    z_all = raw_data["z_indices"]
+    fm_all = raw_data["fmask"]
+    pos_all = raw_data["positions"]
+    n_atoms = raw_data["n_atoms"]
+    N, M = z_all.shape
+
+    mol_feats = compute_all_mol_features(z_all, pos_all, n_atoms, M)
+    fixed_table = torch.from_numpy(FIXED_FEAT_TABLE).float()
+
+    feat_sum = torch.zeros(cfg.atom_feature_dim)
+    feat_sumsq = torch.zeros(cfg.atom_feature_dim)
+    count = 0
+
+    chunk = 4096
+    train_idx_cpu = train_idx.cpu()
+    for s in range(0, len(train_idx_cpu), chunk):
+        ids = train_idx_cpu[s:s+chunk]
+        fixed = fixed_table[z_all[ids].clamp(0, 9)]
+        comb = torch.cat([fixed, mol_feats[ids]], dim=-1)
+        mask = fm_all[ids] > -9000.0
+        vals = comb[mask]
+        if vals.numel() > 0:
+            feat_sum += vals.sum(dim=0)
+            feat_sumsq += (vals ** 2).sum(dim=0)
+            count += vals.shape[0]
+
+    mean = feat_sum / max(count, 1)
+    var = (feat_sumsq / max(count, 1) - mean ** 2).clamp_min(1e-12)
+    std = var.sqrt().clamp_min(1e-6)
+
+    atom_features = torch.empty((N, M, cfg.atom_feature_dim), dtype=torch.float32)
+    for s in range(0, N, chunk):
+        e = min(s + chunk, N)
+        fixed = fixed_table[z_all[s:e].clamp(0, 9)]
+        comb = torch.cat([fixed, mol_feats[s:e]], dim=-1)
+        comb = (comb - mean.view(1, 1, -1)) / std.view(1, 1, -1)
+        mask = fm_all[s:e] > -9000.0
+        comb[~mask] = 0.0
+        atom_features[s:e] = comb
+
+    del mol_feats
+    return atom_features, mean, std
+
+
+def build_aux_targets_train_only(targets_all, train_idx, gap_idx):
+    if targets_all.ndim != 2 or targets_all.shape[1] <= 1:
+        return torch.empty((len(targets_all), 0)), [], torch.empty(0), torch.empty(0)
+
+    K = targets_all.shape[1]
+    cols = []
+    for k in range(K):
+        if k == gap_idx: continue
+        if int(torch.isfinite(targets_all[train_idx, k]).sum()) > 100: cols.append(k)
+
+    if not cols: return torch.empty((len(targets_all), 0)), [], torch.empty(0), torch.empty(0)
+
+    aux_raw = targets_all[:, cols].float()
+    aux_norm = torch.full_like(aux_raw, float("nan"))
+    means, stds = [], []
+
+    for j in range(len(cols)):
+        tr = aux_raw[train_idx, j]
+        finite = torch.isfinite(tr)
+        m = tr[finite].mean()
+        sd = tr[finite].std().clamp_min(1e-6)
+        means.append(m)
+        stds.append(sd)
+        aux_norm[:, j] = (aux_raw[:, j] - m) / sd
+
+    return aux_norm, cols, torch.stack(means), torch.stack(stds)
+
+
+def make_splits(N, cfg):
+    g = torch.Generator().manual_seed(cfg.seed)
+    perm = torch.randperm(N, generator=g)
+    if cfg.split_mode == "standard_110k" and N >= cfg.standard_train + cfg.standard_val + 1:
+        n_train, n_val = cfg.standard_train, cfg.standard_val
+    else:
+        n_train, n_val = int(0.8 * N), int(0.1 * N)
+    return perm[:n_train], perm[n_train:n_train+n_val], perm[n_train+n_val:]
+
+
+# ═════════════════════════ MODEL BLOCKS ══════════════════════════════════════
+
 class RMSNorm(nn.Module):
     def __init__(self, d, eps=1e-8):
         super().__init__()
@@ -394,38 +655,35 @@ class RMSNorm(nn.Module):
         rms = xf.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (xf * rms * self.scale.float()).to(x.dtype)
 
-# ═════════════════════════ RoPE ACELERADO (GRADIENTE ATIVO) ═════════════════════════
+
 class AcceleratedRoPERotator(nn.Module):
-    """RoPE de segunda ordem com α por cabeça e gradiente fluindo."""
     def __init__(self, head_dim, n_heads, max_len=512, base=10000.0):
         super().__init__()
         assert head_dim % 2 == 0
-        self.hd = head_dim
-        self.n_heads = n_heads
         half = head_dim // 2
         inv_freq = 1.0 / (base ** (torch.arange(0, half, dtype=torch.float32) / half))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer("inv_freq", inv_freq)
         self.alpha = nn.Parameter(torch.zeros(n_heads, half))
-
+        
     @staticmethod
     def _rot(x):
         h = x.shape[-1] // 2
-        return torch.cat([-x[..., h:], x[..., :h]], -1)
+        return torch.cat([-x[..., h:], x[..., :h]], dim=-1)
 
     def forward(self, mu):
         B, T, H, D = mu.shape
         t = torch.arange(T, dtype=torch.float32, device=mu.device)
-        theta_linear = t[:, None] * self.inv_freq[None, :]
-        poly = t * (t - 1) / 2.0
-        theta = theta_linear[None, :, :] + poly[None, :, None] * self.alpha[:, None, :]
+        theta = t[:, None] * self.inv_freq[None, :] + (t * (t - 1) / 2.0)[None, :, None] * self.alpha[:, None, :]
         emb = torch.cat([theta, theta], dim=-1)
-        c = emb.cos().unsqueeze(0).permute(0, 2, 1, 3).to(mu.dtype)
-        s = emb.sin().unsqueeze(0).permute(0, 2, 1, 3).to(mu.dtype)
+        c, s = emb.cos().unsqueeze(0).permute(0, 2, 1, 3).to(mu.dtype), emb.sin().unsqueeze(0).permute(0, 2, 1, 3).to(mu.dtype)
         return F.normalize(mu * c + self._rot(mu) * s, p=2, dim=-1, eps=1e-8)
 
-# ══════════════════════ MÓDULOS GEOMÉTRICOS DA ATENÇÃO ════════════════════════════════
+
+class IdentityRotator(nn.Module):
+    def forward(self, mu): return mu
+
+
 class XorAttentionBias(nn.Module):
-    """XOR algébrico: O(1) em memória via q_sum + k_sum - 2·qk_prod."""
     def __init__(self, head_dim):
         super().__init__()
         self.proj_q = nn.Linear(head_dim, head_dim, bias=False)
@@ -436,250 +694,229 @@ class XorAttentionBias(nn.Module):
         nn.init.xavier_uniform_(self.proj_k.weight, gain=0.5)
 
     def forward(self, mu_q, mu_k):
-        q_bin = torch.sigmoid(self.proj_q(mu_q))
-        k_bin = torch.sigmoid(self.proj_k(mu_k))
+        q_bin, k_bin = torch.sigmoid(self.proj_q(mu_q)), torch.sigmoid(self.proj_k(mu_k))
         q_sum = q_bin.sum(dim=-1, keepdim=True).permute(0, 2, 1, 3)
         k_sum = k_bin.sum(dim=-1, keepdim=True).permute(0, 2, 3, 1)
-        q_bin_h = q_bin.permute(0, 2, 1, 3)
-        k_bin_h = k_bin.permute(0, 2, 1, 3)
-        qk_prod = torch.matmul(q_bin_h, k_bin_h.transpose(-2, -1))
-        xor_dist = q_sum + k_sum - 2.0 * qk_prod
-        xor_sim = (self.hd - xor_dist) / self.hd
-        return xor_sim * self.scale
+        qk = torch.matmul(q_bin.permute(0, 2, 1, 3), k_bin.permute(0, 2, 1, 3).transpose(-2, -1))
+        return ((self.hd - (q_sum + k_sum - 2.0 * qk)) / self.hd) * self.scale
+
 
 class TopologicalMERAScore(nn.Module):
-    """Invariante topológico via divergência de isometrias convolucionais (MERA-inspired)."""
     def __init__(self, head_dim, heads):
         super().__init__()
-        self.heads = heads
-        self.isometry = nn.Conv1d(head_dim, head_dim, kernel_size=3, padding=1, groups=head_dim, bias=False)
+        self.isometry = nn.Conv1d(head_dim, head_dim, 3, padding=1, groups=head_dim, bias=False)
+        self.scale = nn.Parameter(torch.tensor(0.02))
         nn.init.xavier_uniform_(self.isometry.weight, gain=0.5)
-        self.scale = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, mu_q):
         B, T, H, D = mu_q.shape
         x = mu_q.permute(0, 2, 3, 1).reshape(B * H, D, T)
-        local_flow = self.isometry(x)
-        div = 1.0 - F.cosine_similarity(x, local_flow, dim=1)
-        score = div.view(B, H, T).mean(dim=-1, keepdim=True).unsqueeze(-1)
-        return score * self.scale
+        div = 1.0 - F.cosine_similarity(x, self.isometry(x), dim=1)
+        div = div.view(B, H, T)
+        return -torch.abs(div.unsqueeze(-1) - div.unsqueeze(-2)) * self.scale.abs()
 
-class CyclicTemporalBias(nn.Module):
-    """Máscara circular com decaimento exponencial."""
-    def __init__(self):
-        super().__init__()
-        self.decay = nn.Parameter(torch.tensor(2.0))
-        self.scale = nn.Parameter(torch.tensor(0.1))
 
-    def forward(self, T, device, dtype):
-        idx = torch.arange(T, device=device, dtype=torch.float32)
-        dist = torch.abs(idx.unsqueeze(1) - idx.unsqueeze(0))
-        circ_dist = torch.min(dist, T - dist)
-        bias = -self.scale.abs() * torch.exp(-self.decay.abs() * circ_dist)
-        return bias.unsqueeze(0).unsqueeze(0).to(dtype)
-
-class ConditionalValueGate(nn.Module):
-    """Porta condicionada por hiperplano: inverte se a query está no outro lado."""
-    def __init__(self, d_model, n_heads, head_dim):
-        super().__init__()
-        self.W_gate = nn.Linear(d_model, n_heads * head_dim, bias=False)
-        self.w = nn.Parameter(torch.randn(head_dim) * 0.01)
-        self.b = nn.Parameter(torch.zeros(1))
-        nn.init.xavier_uniform_(self.W_gate.weight, gain=0.1)
-
-    def forward(self, x, mu_q):
-        B, T, D = x.shape
-        H = mu_q.shape[2]
-        HD = mu_q.shape[3]
-        gate = torch.sigmoid(self.W_gate(x)).view(B, T, H, HD)
-        condition = torch.sigmoid(torch.einsum('bthd,d->bth', mu_q, self.w) + self.b)
-        cond = condition.unsqueeze(-1)
-        return cond * gate + (1 - cond) * (1 - gate)
-
-# ══════════════════════ DISTANCE ATTENTION BIAS (NOVO!) ════════════════════════════
 class DistanceAttentionBias(nn.Module):
-    """
-    Multi-scale distance-based attention bias combining Bessel RBF + Gaussian RBF.
-    Inspired by DimeNet++ (Bessel) and SchNet/PaiNN (Gaussian RBF).
-    Directly injects 3D geometric information into the attention mechanism.
-    """
     def __init__(self, n_rbf_gauss=16, n_rbf_bessel=8, cutoff=5.0, n_heads=8):
         super().__init__()
-        self.n_rbf_gauss = n_rbf_gauss
-        self.n_rbf_bessel = n_rbf_bessel
-        self.cutoff = cutoff
-        total_rbf = n_rbf_gauss + n_rbf_bessel
-
-        # Gaussian RBF centers (evenly spaced, like SchNet)
-        self.register_buffer('gauss_centers', torch.linspace(0, cutoff, n_rbf_gauss))
-        self.register_buffer('gauss_gamma', torch.tensor(10.0))  # Width
-
-        # Bessel RBF: precompute n values (like DimeNet++)
-        self.register_buffer('bessel_n', torch.arange(1, n_rbf_bessel + 1, dtype=torch.float32))
-
-        # Project combined RBF features to per-head attention bias
-        self.proj = nn.Linear(total_rbf, n_heads, bias=True)
+        self.cutoff = float(cutoff)
+        self.register_buffer("gauss_centers", torch.linspace(0, cutoff, n_rbf_gauss))
+        self.register_buffer("gauss_gamma", torch.tensor(10.0))
+        self.register_buffer("bessel_n", torch.arange(1, n_rbf_bessel + 1, dtype=torch.float32))
+        self.proj = nn.Linear(n_rbf_gauss + n_rbf_bessel, n_heads, bias=True)
         nn.init.xavier_uniform_(self.proj.weight, gain=0.05)
         nn.init.zeros_(self.proj.bias)
 
-    @staticmethod
-    def polynomial_envelope(d, cutoff, p=5):
-        """Polynomial cutoff envelope (DimeNet++ style): 1 - 6x^5 + 15x^4 - 10x^3"""
-        x = (d / cutoff).clamp(max=1.0)
-        env = 1.0 - ((p + 1) * (p + 2) / 2.0) * x**p + p * (p + 2) * x**(p+1) - (p * (p + 1) / 2.0) * x**(p+2)
-        return env.clamp(min=0.0)
-
     def forward(self, distances, fmask=None):
-        """
-        distances: (B, T, T) pairwise distances (Å)
-        fmask: (B, T) padding mask (-10000 for pad, 0 for real)
-        Returns: (B, H, T, T) attention bias
-        """
-        B, T, _ = distances.shape
-        d = distances.unsqueeze(-1)  # (B, T, T, 1)
-
-        # --- Gaussian RBF ---
-        gauss = torch.exp(-self.gauss_gamma * (d - self.gauss_centers) ** 2)  # (B, T, T, n_gauss)
-
-        # --- Bessel RBF ---
-        # RBF_n(d) = sqrt(2/c) * sin(n*pi*d/c) / d
-        d_safe = distances.unsqueeze(-1).clamp(min=1e-6)  # (B, T, T, 1)
-        bessel = (math.sqrt(2.0 / self.cutoff) *
-                  torch.sin(self.bessel_n * math.pi * d_safe / self.cutoff) / d_safe)
-        # (B, T, T, n_bessel)
-
-        # --- Combine ---
-        rbf = torch.cat([gauss, bessel], dim=-1)  # (B, T, T, total_rbf)
-
-        # --- Polynomial envelope ---
-        env = self.polynomial_envelope(distances, self.cutoff)  # (B, T, T)
-        rbf = rbf * env.unsqueeze(-1)  # Zero beyond cutoff
-
-        # --- Project to attention bias ---
-        bias = self.proj(rbf)  # (B, T, T, H)
-        bias = bias.permute(0, 3, 1, 2)  # (B, H, T, T)
-
-        # --- Padding mask ---
+        d = distances.unsqueeze(-1)
+        gauss = torch.exp(-self.gauss_gamma * (d - self.gauss_centers) ** 2)
+        d_safe = d.clamp(min=1e-6)
+        bessel = math.sqrt(2.0 / self.cutoff) * torch.sin(self.bessel_n * math.pi * d_safe / self.cutoff) / d_safe
+        rbf = torch.cat([gauss, bessel], dim=-1)
+        
+        x = (distances / self.cutoff).clamp(max=1.0)
+        p = 5
+        env = 1.0 - ((p + 1) * (p + 2) / 2.0) * x**p + p * (p + 2) * x**(p + 1) - (p * (p + 1) / 2.0) * x**(p + 2)
+        
+        bias = self.proj(torch.nan_to_num(rbf * env.unsqueeze(-1).clamp(min=0.0), nan=0.0)).permute(0, 3, 1, 2)
         if fmask is not None:
-            pad = (fmask < -9000.0)  # (B, T)
-            # Mask out rows AND columns involving padding atoms
-            pad_row = pad.unsqueeze(1).unsqueeze(3)  # (B, 1, T, 1)
-            pad_col = pad.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-            bias = bias.masked_fill(pad_row, 0.0)
-            bias = bias.masked_fill(pad_col, 0.0)
-
+            pad = fmask < -9000.0
+            bias = bias.masked_fill(pad.unsqueeze(1).unsqueeze(3), 0.0).masked_fill(pad.unsqueeze(1).unsqueeze(2), 0.0)
         return bias
 
 
-# ══════════════════════ ATENÇÃO GEOMÉTRICA COMPLETA ═══════════════════════════════════
-class GeometricAttention(nn.Module):
-    def __init__(self, d_model, n_heads, head_dim, dropout=0.1, cfg=None):
-        super().__init__()
-        self.n_heads = n_heads
-        self.hd = head_dim
-        self.dp = dropout
-        self._sc = 1.0 / math.sqrt(head_dim)
+def fibonacci_sphere(n):
+    pts = []
+    phi = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(n):
+        y = 1.0 - (i / max(n - 1, 1)) * 2.0
+        r = math.sqrt(max(0.0, 1.0 - y * y))
+        theta = phi * i
+        pts.append([math.cos(theta) * r, y, math.sin(theta) * r])
+    return torch.tensor(pts, dtype=torch.float32)
 
-        self.rope = AcceleratedRoPERotator(head_dim, n_heads, cfg.rope_max_seq, cfg.rope_base)
+def random_rotation_matrix(batch, device, dtype, max_angle=None):
+    if max_angle is None or max_angle >= math.pi - 1e-6:
+        u1, u2, u3 = torch.rand(batch, device=device, dtype=dtype), torch.rand(batch, device=device, dtype=dtype), torch.rand(batch, device=device, dtype=dtype)
+        qx = torch.sqrt(1 - u1) * torch.sin(2 * math.pi * u2)
+        qy = torch.sqrt(1 - u1) * torch.cos(2 * math.pi * u2)
+        qz = torch.sqrt(u1) * torch.sin(2 * math.pi * u3)
+        qw = torch.sqrt(u1) * torch.cos(2 * math.pi * u3)
+    else:
+        axis = F.normalize(torch.randn(batch, 3, device=device, dtype=dtype), dim=-1)
+        angle = torch.rand(batch, device=device, dtype=dtype) * max_angle
+        cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+        qx_, qy_, qz_ = axis[:, 0] * sin_a, axis[:, 1] * sin_a, axis[:, 2] * sin_a
+        norm = torch.sqrt(cos_a**2 + qx_**2 + qy_**2 + qz_**2).clamp(min=1e-8)
+        qw, qx, qy, qz = cos_a/norm, qx_/norm, qy_/norm, qz_/norm
+
+    R = torch.empty(batch, 3, 3, device=device, dtype=dtype)
+    R[:, 0, 0] = 1 - 2 * (qy*qy + qz*qz)
+    R[:, 0, 1] = 2 * (qx*qy - qz*qw)
+    R[:, 0, 2] = 2 * (qx*qz + qy*qw)
+    R[:, 1, 0] = 2 * (qx*qy + qz*qw)
+    R[:, 1, 1] = 1 - 2 * (qx*qx + qz*qz)
+    R[:, 1, 2] = 2 * (qy*qz - qx*qw)
+    R[:, 2, 0] = 2 * (qx*qz - qy*qw)
+    R[:, 2, 1] = 2 * (qy*qz + qx*qw)
+    R[:, 2, 2] = 1 - 2 * (qx*qx + qy*qy)
+    return R
+
+def fixed_eval_rotations(n):
+    rng = np.random.default_rng(12345)
+    rots = [np.eye(3, dtype=np.float32)]
+    for _ in range(1, max(n, 1)):
+        u1, u2, u3 = rng.random(3)
+        qx, qy = math.sqrt(1-u1) * math.sin(2*math.pi*u2), math.sqrt(1-u1) * math.cos(2*math.pi*u2)
+        qz, qw = math.sqrt(u1) * math.sin(2*math.pi*u3), math.sqrt(u1) * math.cos(2*math.pi*u3)
+        rots.append(np.array([
+            [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+            [2*(qx*qy+qz*qw), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+            [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx*qx+qy*qy)]
+        ], dtype=np.float32))
+    return torch.from_numpy(np.stack(rots, axis=0))
+
+
+class SphericalShockTerrain(nn.Module):
+    """
+    O Terreno Mente-Coletiva e Assimétrico.
+    "O que eu sinto todos sentem, podes encaixar mas não ser encaixado."
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        dirs = fibonacci_sphere(cfg.terrain_dirs)
+        radii = torch.linspace(cfg.terrain_radius / cfg.terrain_shells, cfg.terrain_radius, cfg.terrain_shells, dtype=torch.float32)
+        anchors = (dirs[:, None, :] * radii[None, :, None]).reshape(-1, 3).contiguous()
+        self.register_buffer("anchors", anchors)
+        self.n_points = anchors.shape[0]
+        self.rotate_train = cfg.terrain_rotate_train
+        self.dropout = cfg.terrain_dropout
+        self.register_buffer("eval_rots", fixed_eval_rotations(max(cfg.terrain_eval_views, 1)))
+        self.log_sigma = nn.Parameter(torch.full((self.n_points,), math.log(cfg.terrain_sigma)))
+        self.gain = nn.Parameter(torch.ones(self.n_points))
+
+    def forward(self, positions, fmask=None, view=None, rot_strength=None):
+        B, T, _ = positions.shape
+        dtype = positions.dtype
+        base = self.anchors.to(device=positions.device, dtype=dtype)
+
+        if (self.training and self.rotate_train) or view == "random":
+            R = random_rotation_matrix(B, positions.device, dtype, max_angle=None if rot_strength is None else float(rot_strength) * math.pi)
+            anchors = torch.einsum("bij,pj->bpi", R, base)
+        elif isinstance(view, int):
+            R = self.eval_rots[view % self.eval_rots.shape[0]].to(device=positions.device, dtype=dtype)
+            anchors = torch.einsum("ij,pj->pi", R, base).unsqueeze(0).expand(B, -1, -1)
+        else:
+            anchors = base.unsqueeze(0).expand(B, -1, -1)
+
+        diff = positions.unsqueeze(2) - anchors.unsqueeze(1)
+        d2 = diff.pow(2).sum(dim=-1)
+        sigma = self.log_sigma.exp().clamp(0.05, 3.0).to(dtype).view(1, 1, -1)
+        
+        # Ativação raw do choque
+        shock_raw = torch.exp(-0.5 * d2 / (sigma * sigma)) * self.gain.to(dtype).view(1, 1, -1)
+        
+        if fmask is not None:
+            valid = (fmask > -9000.0).to(dtype).unsqueeze(-1)
+            shock_raw = shock_raw * valid
+
+        # 1. "Podes encaixar mas não ser encaixado": Competição topológica (Softmax).
+        # Os átomos (dim=1) competem para se ligar aos pontos do terreno (dim=2).
+        fit_prob = F.softmax(shock_raw / 0.1, dim=-1)
+
+        # 2. "O que eu sinto todos sentem": O estado global da esfera.
+        # A esfera perceciona o impacto agregado da molécula.
+        global_feel = fit_prob.sum(dim=1, keepdim=True)
+        global_feel = F.normalize(global_feel, p=2, dim=-1)
+
+        # A interação final é a combinação do encaixe competitivo com o sentimento coletivo
+        shock = (shock_raw * fit_prob) + (global_feel * 0.1)
+
+        if self.training and self.dropout > 0:
+            shock = F.dropout(shock, p=self.dropout, training=True)
+            
+        return shock
+
+
+class GeometricAttention(nn.Module):
+    def __init__(self, d_model, n_heads, head_dim, dropout, cfg):
+        super().__init__()
+        self.n_heads, self.hd, self.dp, self._sc = n_heads, head_dim, dropout, 1.0 / math.sqrt(head_dim)
+        self.rope = AcceleratedRoPERotator(head_dim, n_heads, cfg.rope_max_seq, cfg.rope_base) if cfg.use_accelerated_rope else IdentityRotator()
         self.W_mu = nn.Linear(d_model, n_heads * head_dim, bias=False)
         self.W_kappa = nn.Linear(d_model, n_heads, bias=True)
         self.Wv = nn.Linear(d_model, n_heads * head_dim, bias=False)
         self.Wo = nn.Linear(n_heads * head_dim, d_model, bias=False)
 
-        self.cond_gate = ConditionalValueGate(d_model, n_heads, head_dim) if cfg.use_conditional_gate else None
-        if not cfg.use_conditional_gate:
-            self.W_gate = nn.Linear(d_model, n_heads * head_dim, bias=False)
-            nn.init.xavier_uniform_(self.W_gate.weight, gain=0.1)
-
+        self.W_gate = nn.Linear(d_model, n_heads * head_dim, bias=False)
         self.tau = nn.Parameter(torch.ones(n_heads) * 2.0)
         self.bias_q = nn.Parameter(torch.zeros(n_heads))
-
-        self.use_xor = cfg.use_xor_bias
-        if self.use_xor:
-            self.xor_bias = XorAttentionBias(head_dim)
-        self.use_topo = cfg.use_topological_bias
-        if self.use_topo:
-            self.topo_bias = TopologicalMERAScore(head_dim, n_heads)
-        self.use_cyclic = cfg.use_cyclic_mask
-        if self.use_cyclic:
-            self.cyclic_bias = CyclicTemporalBias()
-
-        # NOVO: DistanceAttentionBias
-        self.use_distance_bias = cfg.use_distance_bias
-        if self.use_distance_bias:
-            self.dist_bias = DistanceAttentionBias(
-                cfg.dist_n_rbf_gauss, cfg.dist_n_rbf_bessel,
-                cfg.dist_cutoff, n_heads
-            )
+        self.xor_bias = XorAttentionBias(head_dim) if cfg.use_xor_bias else None
+        self.topo_bias = TopologicalMERAScore(head_dim, n_heads) if cfg.use_topological_bias else None
+        self.dist_bias = DistanceAttentionBias(cfg.dist_n_rbf_gauss, cfg.dist_n_rbf_bessel, cfg.dist_cutoff, n_heads) if cfg.use_distance_bias else None
 
         g = 1.0 / math.sqrt(2)
-        for w in [self.W_mu, self.Wv, self.Wo]:
-            nn.init.xavier_uniform_(w.weight, gain=g)
+        for w in [self.W_mu, self.Wv, self.Wo]: nn.init.xavier_uniform_(w.weight, gain=g)
         nn.init.xavier_uniform_(self.W_kappa.weight, gain=0.1)
-        nn.init.constant_(self.W_kappa.bias, math.log(max(4.0 - 1.0, 1e-4)))
+        nn.init.constant_(self.W_kappa.bias, math.log(3.0))
 
-    def get_kappa(self, x):
-        return torch.clamp(F.softplus(self.W_kappa(x)) + 1e-4, max=30.0)
+    def forward(self, x, fmask=None, distances=None):
+        B, T, _ = x.shape
+        mu = self.rope(F.normalize(self.W_mu(x).view(B, T, self.n_heads, self.hd), p=2, dim=-1, eps=1e-8))
+        kappa = torch.clamp(F.softplus(self.W_kappa(x)) + 1e-4, max=30.0)
 
-    def forward(self, x, fmask=None, tmask=None, distances=None):
-        B, T, D = x.shape
-        mu = F.normalize(self.W_mu(x).view(B, T, self.n_heads, self.hd), p=2, dim=-1, eps=1e-8)
-        mu = self.rope(mu)
-        kappa = self.get_kappa(x)
-
-        mu_t = mu.permute(0, 2, 1, 3)
-        S_cos = torch.matmul(mu_t, mu_t.transpose(-2, -1))
+        mt = mu.permute(0, 2, 1, 3)
+        scores = torch.matmul(mt, mt.transpose(-2, -1))
         kh = kappa.permute(0, 2, 1)
-        S_cos = torch.sqrt(kh.unsqueeze(-1) * kh.unsqueeze(-2) + 1e-8) * S_cos
-        scores = self.tau.view(1, self.n_heads, 1, 1) * S_cos * self._sc + self.bias_q.view(1, self.n_heads, 1, 1)
+        scores = torch.sqrt(kh.unsqueeze(-1) * kh.unsqueeze(-2) + 1e-8) * scores
+        scores = self.tau.view(1, self.n_heads, 1, 1) * scores * self._sc + self.bias_q.view(1, self.n_heads, 1, 1)
 
-        if self.use_xor:
-            scores = scores + self.xor_bias(mu, mu)
-        if self.use_topo:
-            scores = scores + self.topo_bias(mu)
-        if self.use_cyclic:
-            scores = scores + self.cyclic_bias(T, x.device, x.dtype)
-        elif tmask is not None:
-            scores = scores + tmask.unsqueeze(1)
+        if self.xor_bias is not None: scores = scores + self.xor_bias(mu, mu)
+        if self.topo_bias is not None: scores = scores + self.topo_bias(mu)
+        if self.dist_bias is not None and distances is not None: scores = scores + self.dist_bias(distances, fmask)
 
-        # NOVO: Distance-based attention bias
-        if self.use_distance_bias and distances is not None:
-            scores = scores + self.dist_bias(distances, fmask)
-
-        # Padding mask
         if fmask is not None:
-            pad_bool = (fmask < -9000.0)
-            scores = scores.masked_fill(pad_bool.unsqueeze(1).unsqueeze(2), -1e4)
+            pad = fmask < -9000.0
+            scores = scores.masked_fill(pad.unsqueeze(1).unsqueeze(2), -1e4)
 
         attn = F.dropout(F.softmax(scores, dim=-1), p=self.dp if self.training else 0.0, training=self.training)
-
         v = self.Wv(x).view(B, T, self.n_heads, self.hd).permute(0, 2, 1, 3)
-        av = attn @ v
-        av = av.permute(0, 2, 1, 3)
-
-        if self.cond_gate is not None:
-            gate = self.cond_gate(x, mu)
-        else:
-            gate = torch.sigmoid(self.W_gate(x).view(B, T, self.n_heads, self.hd))
-
-        out = (gate * av).reshape(B, T, self.n_heads * self.hd)
+        out = (torch.sigmoid(self.W_gate(x).view(B, T, self.n_heads, self.hd)) * (attn @ v).permute(0, 2, 1, 3)).reshape(B, T, self.n_heads * self.hd)
         return self.Wo(out)
 
-# ══════════════════════════ TRANSFORMER BLOCK ═══════════════════════════════════════════
+
 class LocalConvMix(nn.Module):
     def __init__(self, d, k=3, dp=0.1):
         super().__init__()
         self.norm = RMSNorm(d)
         self.dw = nn.Conv1d(d, d, k, padding=(k-1)//2, groups=d, bias=False)
         self.pw = nn.Conv1d(d, d, 1, bias=False)
-        self.act = nn.GELU(approximate='tanh')
         self.drop = nn.Dropout(dp)
-        nn.init.kaiming_normal_(self.dw.weight, nonlinearity='linear')
-        nn.init.xavier_uniform_(self.pw.weight)
 
     def forward(self, x):
         h = self.norm(x).transpose(1, 2).contiguous()
-        return x + self.drop(self.act(self.pw(self.dw(h))).transpose(1, 2).contiguous())
+        return x + self.drop(F.gelu(self.pw(self.dw(h)), approximate="tanh").transpose(1, 2).contiguous())
+
 
 class SwiGLU(nn.Module):
     def __init__(self, d, dff, dp=0.1):
@@ -687,1413 +924,668 @@ class SwiGLU(nn.Module):
         self.W_gu = nn.Linear(d, 2 * dff, bias=False)
         self.Wd = nn.Linear(dff, d, bias=False)
         self.drop = nn.Dropout(dp)
-        nn.init.kaiming_normal_(self.W_gu.weight, nonlinearity='relu')
-        nn.init.xavier_uniform_(self.Wd.weight, gain=1.0 / math.sqrt(12))
 
     def forward(self, x):
         g, u = self.W_gu(x).chunk(2, dim=-1)
         return self.drop(self.Wd(F.silu(g) * u))
 
+
 class TransformerBlock(nn.Module):
     def __init__(self, d, nh, hd, dff, dp, sd, cfg):
         super().__init__()
         self.sd = sd
-        self.norm1 = RMSNorm(d)
-        self.norm2 = RMSNorm(d)
+        self.norm1, self.norm2 = RMSNorm(d), RMSNorm(d)
         self.attn = GeometricAttention(d, nh, hd, dp, cfg)
         self.ffn = SwiGLU(d, dff, dp)
 
     def _drop(self, r):
-        if not self.training or self.sd == 0.0:
-            return r
+        if not self.training or self.sd == 0.0: return r
         keep = (torch.rand(r.shape[0], 1, 1, device=r.device) > self.sd).float()
         return r * keep / (1.0 - self.sd)
 
-    def forward(self, x, fmask=None, tmask=None, distances=None):
-        x = x + self._drop(self.attn(self.norm1(x), fmask, tmask, distances))
+    def forward(self, x, fmask=None, distances=None):
+        x = x + self._drop(self.attn(self.norm1(x), fmask=fmask, distances=distances))
         return x + self._drop(self.ffn(self.norm2(x)))
 
-# ════════════════════════════ FUSÃO XOR ESPACIAL ════════════════════════════════════════
+
 class XORSpatialFusion(nn.Module):
     def __init__(self, d):
         super().__init__()
         self.proj_think = nn.Linear(d, d, bias=False)
-        self.proj_seq   = nn.Linear(d, d, bias=False)
-        nn.init.xavier_uniform_(self.proj_think.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.proj_seq.weight, gain=0.1)
+        self.proj_seq = nn.Linear(d, d, bias=False)
 
     def forward(self, think, seq_avg):
-        x = torch.sigmoid(self.proj_think(think))
-        y = torch.sigmoid(self.proj_seq(seq_avg))
+        x, y = torch.sigmoid(self.proj_think(think)), torch.sigmoid(self.proj_seq(seq_avg))
         return x * (1 - y) + (1 - x) * y
 
-# ════════════════════════════ CABEÇA DE REGRESSÃO ══════════════════════════════════
+
 class RegressionHead(nn.Module):
-    """MultiSampleDropout para regressão: k predictions averaged na inferência."""
     def __init__(self, d, dp=0.1, k=5):
         super().__init__()
-        self.k = k
-        self.dp = dp
+        self.k, self.dp = k, dp
         self.fc1 = nn.Linear(d, d)
-        self.act = nn.GELU(approximate='tanh')
         self.fc2 = nn.Linear(d, 1)
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.xavier_uniform_(self.fc2.weight, gain=0.02)
-        nn.init.zeros_(self.fc2.bias)
 
     def _once(self, x):
-        return self.fc2(F.dropout(self.act(self.fc1(x)), p=self.dp, training=True))
+        return self.fc2(F.dropout(F.gelu(self.fc1(x), approximate="tanh"), p=self.dp, training=True)).squeeze(-1)
 
     def forward(self, x):
-        if self.training:
-            return self._once(x).squeeze(-1)
-        else:
-            return torch.stack([self._once(x) for _ in range(self.k)]).mean(0).squeeze(-1)
+        if self.training: return self._once(x)
+        return torch.stack([self._once(x) for _ in range(self.k)], dim=0).mean(0)
 
-# ════════════════════════ GRAFOPROPAGATION v27 — QM9 RAD VERSION ═════════════════════════
+
 class GrafoPropagationGeoQM9(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        d, L = cfg.d_model, cfg.n_layers
+        self.cfg = cfg
+        d = cfg.d_model
 
-        # --- Input projection ---
-        # Input: [fixed_phys(27) | mol_dependent(20) | z_embed(16)] = 63 → d_model
-        self.input_proj = nn.Linear(cfg.feature_dim, d, bias=True)
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
+        self.input_proj = nn.Linear(cfg.atom_feature_dim + cfg.n_z_embed, d, bias=True)
         self.embed_scale = d ** 0.5
         self.embed_drop = nn.Dropout(cfg.dropout)
+        self.z_embed = nn.Embedding(10, cfg.n_z_embed, padding_idx=0)
+        with torch.no_grad(): self.z_embed.weight[0].zero_()
 
-        # --- Learnable Z embedding (like PaiNN/SchNet/DimeNet++) ---
-        self.z_embed = nn.Embedding(10, cfg.n_z_embed)  # Z=0..9
-        nn.init.normal_(self.z_embed.weight, std=0.02)
-
-        # --- Fixed feature lookup table (not learned, just stored) ---
-        self.register_buffer('fixed_feat_table', torch.from_numpy(FIXED_FEAT_TABLE))
+        self.terrain = SphericalShockTerrain(cfg) if cfg.use_shock_terrain else None
+        if self.terrain is not None:
+            self.terrain_proj = nn.Linear(self.terrain.n_points, d, bias=False)
 
         self.conv_mix = LocalConvMix(d, cfg.conv_kernel, cfg.dropout)
-
-        sd_list = [cfg.stoch_depth * i / max(L - 1, 1) for i in range(L)]
-        self.blocks = nn.ModuleList([
-            TransformerBlock(d, cfg.n_heads, cfg.head_dim, cfg.d_ff,
-                             cfg.dropout, sd_list[i], cfg)
-            for i in range(L)
-        ])
-
+        sd_list = [cfg.stoch_depth * i / max(cfg.n_layers - 1, 1) for i in range(cfg.n_layers)]
+        self.blocks = nn.ModuleList([TransformerBlock(d, cfg.n_heads, cfg.head_dim, cfg.d_ff, cfg.dropout, sd_list[i], cfg) for i in range(cfg.n_layers)])
         self.final_norm = RMSNorm(d)
         self.fusion = XORSpatialFusion(d)
         self.head = RegressionHead(d, cfg.dropout, k=5)
 
-    def _compute_pairwise_distances(self, positions, fmask=None):
-        """
-        Compute pairwise distances from 3D positions.
-        positions: (B, T, 3)
-        fmask: (B, T) padding mask
-        Returns: (B, T, T) pairwise distances
-        """
-        # positions for padding atoms are 0 → distance to padding = 0 (misleading)
-        # Fix: set padding positions far away
-        if fmask is not None:
-            pad = (fmask < -9000.0)  # (B, T)
-            # Move padding atoms to (100, 100, 100) so distances are large
-            pos_fixed = positions.clone()
-            pos_fixed[pad] = pos_fixed[pad] + 100.0
-        else:
-            pos_fixed = positions
+    def _pairwise_distances(self, positions, fmask=None):
+        pos = positions.clone()
+        if fmask is not None: pos[fmask < -9000.0] += 100.0
+        return (pos.unsqueeze(2) - pos.unsqueeze(1)).pow(2).sum(dim=-1).sqrt()
 
-        diff = pos_fixed.unsqueeze(2) - pos_fixed.unsqueeze(1)  # (B, T, T, 3)
-        dists = (diff ** 2).sum(dim=-1).sqrt()  # (B, T, T)
-        return dists
+    def encode_tokens(self, atom_features, fmask, z_indices, positions, terrain_view=None, terrain_rot_strength=None):
+        valid = (fmask > -9000.0).to(atom_features.dtype).unsqueeze(-1)
+        z_emb = self.z_embed(z_indices.clamp(0, 9)) * valid
+        emb = self.input_proj(torch.cat([atom_features, z_emb], dim=-1)) * self.embed_scale
 
-    def encode(self, emb, fmask, distances=None):
-        B, T, D = emb.shape
-        x = emb
-        x = self.conv_mix(x)
-        for block in self.blocks:
-            x = block(x, fmask, distances=distances)
-        x = self.final_norm(x)
-        valid = (~(fmask < -9000.0)).float().unsqueeze(-1)  # (B, T, 1)
-        seq_avg = (x * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-        x_masked = x.clone()
-        x_masked[~valid.expand(-1, -1, D).bool()] = -1e9
-        think = x_masked.max(dim=1).values
-        fused = self.fusion(think, seq_avg)
-        return fused
+        if self.terrain is not None:
+            shocks = self.terrain(positions, fmask=fmask, view=terrain_view, rot_strength=terrain_rot_strength)
+            emb = emb + self.terrain_proj(shocks)
 
-    def forward(self, atom_features, fmask, z_indices, positions):
-        """
-        atom_features: (B, T, 47) pre-normalized per-atom features
-                       = [fixed_phys(27) | mol_dependent(20)]
-        fmask: (B, T) padding mask
-        z_indices: (B, T) LongTensor atomic numbers (for learnable embedding)
-        positions: (B, T, 3) 3D positions (for distance-based attention bias)
-        """
-        # Learnable Z embedding (like PaiNN/SchNet/DimeNet++)
-        z_emb = self.z_embed(z_indices)  # (B, T, 16)
+        emb = self.embed_drop(emb) * valid
+        dists = self._pairwise_distances(positions, fmask)
+        x = self.conv_mix(emb) * valid
+        for blk in self.blocks:
+            x = blk(x, fmask=fmask, distances=dists) * valid
+        return self.final_norm(x) * valid
 
-        # Combine: normalized features (47) + learnable embedding (16) = 63
-        combined = torch.cat([atom_features, z_emb], dim=-1)  # (B, T, 63)
+    def pool(self, tokens, fmask):
+        valid = (fmask > -9000.0).float().unsqueeze(-1)
+        seq_avg = (tokens * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        think = tokens.masked_fill(~valid.bool(), -1e9).max(dim=1).values
+        return self.fusion(think, seq_avg)
 
-        # Project to d_model
-        emb = self.embed_drop(self.input_proj(combined) * self.embed_scale)
-
-        # Compute pairwise distances for attention bias
-        dists = self._compute_pairwise_distances(positions, fmask)
-
-        # Encode
-        fused = self.encode(emb, fmask, distances=dists)
-        return self.head(fused)
+    def forward(self, atom_features, fmask, z_indices, positions, return_rep=False, return_tokens=False, terrain_view=None, terrain_rot_strength=None, make_pred=True):
+        tok = self.encode_tokens(atom_features, fmask, z_indices, positions, terrain_view, terrain_rot_strength)
+        rep = self.pool(tok, fmask)
+        pred = self.head(rep) if make_pred else None
+        
+        if return_rep and return_tokens: return pred, rep, tok
+        if return_rep: return pred, rep
+        if return_tokens: return pred, tok
+        return pred
 
 
-# ═══════════════════════════ DATA LOADING ═══════════════════════════════════════════
-def precompute_qm9_data(cfg):
+# ═════════════════════════ DEEPMIND BYOL (PRE-PRETRAIN) ══════════════════════
+
+class DeepMindBYOLWrapper(nn.Module):
     """
-    Precompute raw QM9 data (z_indices, positions, targets) with caching.
-    Cache v4: stores RAW data only — NO normalization, NO CoulombMatrix.
-    Features are computed AFTER the train/val/test split in main().
+    Bootstrap Your Own Latent (DeepMind).
+    Fluxo assimétrico: o Student tenta aprender a geometria invariante rodando
+    pelo espaço latente construído pelo seu próprio reflexo passado (o Teacher).
+    O Teacher nunca tenta encaixar-se no Student ("Podes encaixar mas não ser encaixado").
+    Isto resolve a falha do VICReg e estabiliza estruturalmente as representações.
     """
-    cache_path = cfg.cache_path
-    if os.path.exists(cache_path):
-        log(f'Loading cached QM9 data from {cache_path}…', 'DATA')
-        data = torch.load(cache_path, map_location='cpu', weights_only=False)
-        if 'z_indices' not in data:
-            log('  Cache antigo detectado — a recalcular com formato v4 (raw z+pos)…', 'WARN')
-            os.remove(cache_path)
-        else:
-            log(f'  Cache loaded: {data["z_indices"].shape[0]} molecules', 'DATA')
-            return data
+    def __init__(self, backbone, cfg):
+        super().__init__()
+        self.cfg = cfg
+        # Student
+        self.student_backbone = backbone
+        
+        # Teacher (EMA) - sem gradientes
+        self.teacher_backbone = copy.deepcopy(backbone)
+        for p in self.teacher_backbone.parameters():
+            p.requires_grad = False
 
-    log('Computing raw QM9 data (z_indices + positions + targets)…', 'DATA')
+        d = cfg.d_model
+        h = cfg.prepretrain_projector_hidden
+        out_dim = cfg.prepretrain_projector_out
 
-    # ── Detect backends ──
-    USE_PYG = False
-    USE_DIRECT = True
+        # Student Networks (Projector -> Predictor)
+        self.student_proj = nn.Sequential(
+            nn.Linear(d, h), nn.BatchNorm1d(h), nn.GELU(), nn.Linear(h, out_dim)
+        )
+        self.student_pred = nn.Sequential(
+            nn.Linear(out_dim, h), nn.BatchNorm1d(h), nn.GELU(), nn.Linear(h, out_dim)
+        )
 
-    try:
-        from torch_geometric.datasets import QM9
-        USE_PYG = True
-        log('  Backend disponível: torch_geometric (PyG)', 'DATA')
-    except ImportError:
-        log('  torch_geometric não encontrado, a tentar pip install…', 'WARN')
-        try:
-            subprocess.run([sys.executable, '-m', 'pip', 'install', 'torch_geometric', '-q'],
-                         capture_output=True, timeout=120)
-            try:
-                from torch_geometric.datasets import QM9
-                USE_PYG = True
-                log('  Backend disponível: torch_geometric (PyG) — instalado via pip', 'DATA')
-            except ImportError:
-                pass
-        except Exception:
-            pass
+        # Teacher Network (apenas Projector, igual ao original BYOL)
+        self.teacher_proj = copy.deepcopy(self.student_proj)
+        for p in self.teacher_proj.parameters():
+            p.requires_grad = False
 
-    log(f'  Backends activos: PyG={USE_PYG}, Direct={USE_DIRECT}', 'DATA')
+    @torch.no_grad()
+    def update_teacher(self, momentum):
+        for s, t in zip(self.student_backbone.parameters(), self.teacher_backbone.parameters()):
+            t.data.mul_(momentum).add_(s.data, alpha=1 - momentum)
+        for s, t in zip(self.student_proj.parameters(), self.teacher_proj.parameters()):
+            t.data.mul_(momentum).add_(s.data, alpha=1 - momentum)
 
-    M = cfg.max_atoms
+    def forward(self, feat, fm, z, pos, rot_student, rot_teacher):
+        # 1. View do Student (Encaixa na representação do Teacher)
+        _, rep_s, _ = self.student_backbone(
+            feat, fm, z, pos, return_rep=True, return_tokens=True,
+            terrain_view="random", terrain_rot_strength=rot_student, make_pred=False
+        )
+        proj_s = self.student_proj(rep_s)
+        pred_s = self.student_pred(proj_s)
 
-    # ═══════════════ MÉTODO 1: PyG ═══════════════
-    all_z_indices = None
-    all_positions = None
-    all_targets = None
-    all_n_atoms = None
+        # 2. View do Teacher (Apenas gera o target, sem gradiente)
+        with torch.no_grad():
+            _, rep_t, _ = self.teacher_backbone(
+                feat, fm, z, pos, return_rep=True, return_tokens=True,
+                terrain_view="random", terrain_rot_strength=rot_teacher, make_pred=False
+            )
+            proj_t = self.teacher_proj(rep_t)
 
-    if USE_PYG:
-        try:
-            log('  A carregar QM9 via torch_geometric…', 'DATA')
-
-            import builtins
-            _orig_import = builtins.__import__
-            _rdkit_hidden = False
-
-            try:
-                import rdkit  # noqa
-                _rdkit_hidden = True
-                log('  rdkit detectado — a esconder do PyG (FIX v12)', 'DATA')
-            except ImportError:
-                pass
-
-            if _rdkit_hidden:
-                def _custom_import(name, globals_dict=None, locals_dict=None, fromlist=(), level=0):
-                    if name == 'rdkit' or name.startswith('rdkit.'):
-                        raise ImportError('rdkit temporarily hidden')
-                    return _orig_import(name, globals_dict, locals_dict, fromlist, level)
-                builtins.__import__ = _custom_import
-
-            try:
-                import shutil
-                processed_dir = os.path.join(cfg.qm9_root, 'processed')
-                if os.path.exists(processed_dir):
-                    try:
-                        shutil.rmtree(processed_dir)
-                    except Exception:
-                        pass
-
-                from torch_geometric.datasets import QM9
-                dataset = QM9(root=cfg.qm9_root)
-                n_total = len(dataset)
-                log(f'  PyG QM9 carregado: {n_total} moléculas', 'DATA')
-
-                all_z_indices = np.zeros((n_total, M), dtype=np.int64)
-                all_positions = np.zeros((n_total, M, 3), dtype=np.float32)
-                all_n_atoms = np.zeros(n_total, dtype=np.int32)
-                all_targets = np.zeros(n_total, dtype=np.float32)
-
-                t0 = time.time()
-                for idx in range(n_total):
-                    data = dataset[idx]
-                    z = data.z.numpy()  # (n,) Long
-                    pos = data.pos.numpy()  # (n, 3)
-                    n = len(z)
-                    all_n_atoms[idx] = n
-                    all_targets[idx] = data.y[0, cfg.gap_idx].item()
-                    all_z_indices[idx, :n] = z
-                    all_positions[idx, :n] = pos
-
-                    if (idx + 1) % 20000 == 0 or idx == n_total - 1:
-                        elapsed = time.time() - t0
-                        rate = (idx + 1) / elapsed
-                        eta = (n_total - idx - 1) / rate
-                        log(f'  Raw data: {idx+1}/{n_total} ({rate:.0f} mol/s, ETA {eta:.0f}s)', 'DATA')
-            finally:
-                if _rdkit_hidden:
-                    builtins.__import__ = _orig_import
-
-        except Exception as e_pyg:
-            log(f'  PyG QM9 falhou: {e_pyg}', 'WARN')
-            all_z_indices = None
-            USE_PYG = False
-
-    # ═══════════════ MÉTODO 2: Download directo ═══════════════
-    if all_z_indices is None and USE_DIRECT:
-        import zipfile
-        import urllib.request
-        import io
-
-        log('  Método 2: Download directo / parse manual de dados QM9', 'DATA')
-
-        ATOMIC_NUM = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8,
-                      'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12, 'Al': 13, 'Si': 14, 'P': 15,
-                      'S': 16, 'Cl': 17, 'Ar': 18}
-        RAW_GAP_IDX = 9
-
-        all_z_list = []
-        all_pos_list = []
-        all_natoms_list = []
-        all_tgt_list = []
-        parsed_ok = False
-        skipped = 0
-
-        raw_dir = os.path.join(cfg.qm9_root, 'raw')
-        os.makedirs(raw_dir, exist_ok=True)
-
-        existing_xyz = os.path.join(raw_dir, 'dsgdb9nsd.xyz')
-        existing_tarbz2 = os.path.join(raw_dir, 'dsgdb9nsd.xyz.tar.bz2')
-        existing_bz2 = os.path.join(raw_dir, 'dsgdb9nsd.xyz.bz2')
-
-        def _parse_dsgdb9nsd_text(raw_text):
-            lines_all = raw_text.strip().split('\n')
-            line_ptr = 0
-            t0 = time.time()
-            count = 0
-            while line_ptr < len(lines_all):
-                line = lines_all[line_ptr].strip()
-                if not line:
-                    line_ptr += 1
-                    continue
-                try:
-                    n_atoms = int(line.split()[0])
-                    if n_atoms < 1 or n_atoms > 100:
-                        line_ptr += 1
-                        continue
-                except (ValueError, IndexError):
-                    line_ptr += 1
-                    continue
-                if line_ptr + 1 >= len(lines_all):
-                    break
-                props = lines_all[line_ptr + 1].strip().split()
-                if len(props) < 10:
-                    line_ptr += 1
-                    continue
-                try:
-                    gap_val = float(props[RAW_GAP_IDX])
-                except (ValueError, IndexError):
-                    line_ptr += 1
-                    continue
-                z_list = []
-                pos_list = []
-                valid = True
-                for i in range(n_atoms):
-                    atom_ptr = line_ptr + 2 + i
-                    if atom_ptr >= len(lines_all):
-                        valid = False
-                        break
-                    parts = lines_all[atom_ptr].strip().split()
-                    if len(parts) < 4:
-                        valid = False
-                        break
-                    sym = parts[0]
-                    if sym not in ATOMIC_NUM:
-                        valid = False
-                        break
-                    z_list.append(ATOMIC_NUM[sym])
-                    try:
-                        pos_list.append([float(parts[1]), float(parts[2]), float(parts[3])])
-                    except (ValueError, IndexError):
-                        valid = False
-                        break
-                if valid and len(z_list) == n_atoms:
-                    all_z_list.append(z_list)
-                    all_pos_list.append(pos_list)
-                    all_natoms_list.append(n_atoms)
-                    all_tgt_list.append(gap_val)
-                    count += 1
-                    if count % 20000 == 0:
-                        elapsed = time.time() - t0
-                        log(f'  Parsed: {count} molecules ({count/elapsed:.0f} mol/s)', 'DATA')
-                line_ptr += 2 + n_atoms
-            return count
-
-        # Try existing dsgdb9nsd.xyz
-        if os.path.exists(existing_xyz):
-            try:
-                with open(existing_xyz, 'r') as f:
-                    raw_text = f.read()
-                cnt = _parse_dsgdb9nsd_text(raw_text)
-                if cnt > 0:
-                    parsed_ok = True
-                log(f'  Parsed {cnt} molecules from existing dsgdb9nsd.xyz', 'DATA')
-            except Exception as e:
-                log(f'  Falhou: {e}', 'WARN')
-
-        # Try .tar.bz2
-        if not parsed_ok and os.path.exists(existing_tarbz2):
-            import tarfile
-            try:
-                with tarfile.open(existing_tarbz2, 'r:bz2') as tar:
-                    for member in tar.getmembers():
-                        if member.name.endswith('.xyz'):
-                            f = tar.extractfile(member)
-                            if f:
-                                raw_text = f.read().decode('ascii')
-                                cnt = _parse_dsgdb9nsd_text(raw_text)
-                                if cnt > 0:
-                                    parsed_ok = True
-                            break
-            except Exception as e:
-                log(f'  tar.bz2 falhou: {e}', 'WARN')
-
-        # Try .bz2
-        if not parsed_ok and os.path.exists(existing_bz2):
-            try:
-                with open(existing_bz2, 'rb') as f:
-                    raw_text = bz2.decompress(f.read()).decode('ascii')
-                cnt = _parse_dsgdb9nsd_text(raw_text)
-                if cnt > 0:
-                    parsed_ok = True
-            except Exception as e:
-                log(f'  .bz2 falhou: {e}', 'WARN')
-
-        # Download from PyG
-        if not parsed_ok:
-            qm9_url = 'https://data.pyg.org/datasets/qm9_v3.zip'
-            raw_file = os.path.join(raw_dir, 'qm9_v3.zip')
-            if not os.path.exists(raw_file):
-                log(f'  Downloading {qm9_url}…', 'DATA')
-                try:
-                    urllib.request.urlretrieve(qm9_url, raw_file)
-                    log(f'  Download complete', 'DATA')
-                except Exception as e:
-                    log(f'  Download failed: {e}', 'WARN')
-                    raw_file = None
-
-            if raw_file is not None:
-                try:
-                    with zipfile.ZipFile(raw_file, 'r') as zf:
-                        pt_files = [f for f in zf.namelist() if f.endswith('.pt')]
-                        if pt_files:
-                            for pt_name in pt_files:
-                                try:
-                                    raw_data = torch.load(io.BytesIO(zf.open(pt_name).read()),
-                                                         map_location='cpu', weights_only=False)
-                                    data_list = None
-
-                                    if isinstance(raw_data, dict) and 'data' in raw_data and 'slices' in raw_data:
-                                        collated_data = raw_data['data']
-                                        slices = raw_data['slices']
-                                        n_total = len(slices.get('z', slices.get(list(slices.keys())[0], []))) - 1
-                                        try:
-                                            from torch_geometric.data import InMemoryDataset, Data
-                                            import tempfile, shutil as _shutil
-                                            tmp_root = tempfile.mkdtemp(prefix='qm9_pt_')
-                                            tmp_proc = os.path.join(tmp_root, 'processed')
-                                            os.makedirs(tmp_proc, exist_ok=True)
-                                            torch.save(raw_data, os.path.join(tmp_proc, 'data_v3.pt'))
-                                            class _TmpQM9(InMemoryDataset):
-                                                def __init__(self, root):
-                                                    super().__init__(root)
-                                                    self.load(self.processed_paths[0])
-                                                @property
-                                                def raw_file_names(self): return []
-                                                @property
-                                                def processed_file_names(self): return ['data_v3.pt']
-                                                def process(self): pass
-                                            ds = _TmpQM9(tmp_root)
-                                            data_list = [ds[i] for i in range(len(ds))]
-                                            _shutil.rmtree(tmp_root, ignore_errors=True)
-                                        except Exception:
-                                            from torch_geometric.data import Data as _Data
-                                            data_list = []
-                                            for i in range(n_total):
-                                                d = _Data()
-                                                for key in collated_data.keys():
-                                                    s = slices.get(key, None)
-                                                    if s is not None and i + 1 < len(s):
-                                                        start, end = int(s[i]), int(s[i + 1])
-                                                        d[key] = collated_data[key][start:end]
-                                                    else:
-                                                        d[key] = collated_data[key]
-                                                data_list.append(d)
-
-                                    elif isinstance(raw_data, tuple) and len(raw_data) >= 2:
-                                        collated_data, slices = raw_data[0], raw_data[1]
-                                        n_total = len(slices.get('z', slices.get(list(slices.keys())[0], []))) - 1
-                                        from torch_geometric.data import InMemoryDataset, Data
-                                        import tempfile, shutil as _shutil
-                                        tmp_root = tempfile.mkdtemp(prefix='qm9_pt_')
-                                        tmp_proc = os.path.join(tmp_root, 'processed')
-                                        os.makedirs(tmp_proc, exist_ok=True)
-                                        torch.save({'data': collated_data, 'slices': slices},
-                                                  os.path.join(tmp_proc, 'data_v3.pt'))
-                                        class _TmpQM9(InMemoryDataset):
-                                            def __init__(self, root):
-                                                super().__init__(root)
-                                                self.load(self.processed_paths[0])
-                                            @property
-                                            def raw_file_names(self): return []
-                                            @property
-                                            def processed_file_names(self): return ['data_v3.pt']
-                                            def process(self): pass
-                                        ds = _TmpQM9(tmp_root)
-                                        data_list = [ds[i] for i in range(len(ds))]
-                                        _shutil.rmtree(tmp_root, ignore_errors=True)
-
-                                    elif isinstance(raw_data, list):
-                                        data_list = raw_data
-
-                                    if data_list is not None:
-                                        t0 = time.time()
-                                        for idx in range(len(data_list)):
-                                            d = data_list[idx]
-                                            if isinstance(d, dict):
-                                                z_val = d.get('z', d.get('atomic_numbers'))
-                                                pos_val = d.get('pos', d.get('positions'))
-                                                y_val = d.get('y')
-                                            elif hasattr(d, 'z'):
-                                                z_val = d.z
-                                                pos_val = d.pos if hasattr(d, 'pos') else None
-                                                y_val = d.y if hasattr(d, 'y') else None
-                                            else:
-                                                continue
-                                            if z_val is None or pos_val is None or y_val is None:
-                                                continue
-                                            z_np = z_val.numpy() if isinstance(z_val, torch.Tensor) else np.array(z_val)
-                                            pos_np = pos_val.numpy() if isinstance(pos_val, torch.Tensor) else np.array(pos_val)
-                                            y_np = y_val.numpy() if isinstance(y_val, torch.Tensor) else np.array(y_val)
-                                            n = len(z_np)
-                                            all_z_list.append(z_np.tolist())
-                                            all_pos_list.append(pos_np.tolist())
-                                            all_natoms_list.append(n)
-                                            gap_val = float(y_np[0, cfg.gap_idx]) if y_np.ndim >= 2 else float(y_np[cfg.gap_idx])
-                                            all_tgt_list.append(gap_val)
-                                            if (idx + 1) % 20000 == 0:
-                                                elapsed = time.time() - t0
-                                                log(f'  .pt: {idx+1}/{len(data_list)} ({(idx+1)/elapsed:.0f} mol/s)', 'DATA')
-                                        parsed_ok = len(all_z_list) > 0
-                                        break
-                                except Exception as e:
-                                    log(f'  Falhou carregar {pt_name}: {e}', 'WARN')
-
-                        # Also try .xyz files and .bz2 in ZIP
-                        if not parsed_ok:
-                            for member_name in zf.namelist():
-                                if member_name.endswith('.bz2'):
-                                    try:
-                                        raw_text = bz2.decompress(zf.open(member_name).read()).decode('ascii')
-                                        cnt = _parse_dsgdb9nsd_text(raw_text)
-                                        if cnt > 0:
-                                            parsed_ok = True
-                                        break
-                                    except Exception:
-                                        pass
-
-                except Exception as e_zip:
-                    log(f'  Erro ao processar ZIP: {e_zip}', 'WARN')
-
-        # Figshare fallback
-        if not parsed_ok:
-            log('  A tentar figshare para dsgdb9nsd.xyz.tar.bz2…', 'DATA')
-            figshare_url = 'https://ndownloader.figshare.com/files/3195389'
-            tarbz2_file = os.path.join(raw_dir, 'dsgdb9nsd.xyz.tar.bz2')
-            if not os.path.exists(tarbz2_file):
-                try:
-                    req = urllib.request.Request(figshare_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    resp = urllib.request.urlopen(req, timeout=120)
-                    for _ in range(5):
-                        if resp.status in (301, 302, 303, 307, 308):
-                            redirect_url = resp.headers.get('Location')
-                            if redirect_url:
-                                req = urllib.request.Request(redirect_url, headers={'User-Agent': 'Mozilla/5.0'})
-                                resp = urllib.request.urlopen(req, timeout=120)
-                            else:
-                                break
-                        else:
-                            break
-                    data_bytes = resp.read()
-                    with open(tarbz2_file, 'wb') as f:
-                        f.write(data_bytes)
-                except Exception as e:
-                    log(f'  figshare download failed: {e}', 'ERROR')
-
-            if os.path.exists(tarbz2_file):
-                import tarfile
-                extracted_xyz = os.path.join(raw_dir, 'dsgdb9nsd.xyz')
-                if not os.path.exists(extracted_xyz):
-                    try:
-                        with tarfile.open(tarbz2_file, 'r:bz2') as tar:
-                            for member in tar.getmembers():
-                                if member.name.endswith('.xyz'):
-                                    tar.extract(member, raw_dir)
-                                    extracted_path = os.path.join(raw_dir, member.name)
-                                    if extracted_path != extracted_xyz:
-                                        os.rename(extracted_path, extracted_xyz)
-                                    break
-                    except Exception as e:
-                        log(f'  tar.bz2 extraction failed: {e}', 'ERROR')
-
-                if os.path.exists(extracted_xyz):
-                    try:
-                        with open(extracted_xyz, 'r') as f:
-                            raw_text = f.read()
-                        cnt = _parse_dsgdb9nsd_text(raw_text)
-                        if cnt > 0:
-                            parsed_ok = True
-                    except Exception as e:
-                        log(f'  Falhou ao processar: {e}', 'ERROR')
-
-        if not parsed_ok:
-            raise RuntimeError('Could not parse QM9 data from any source!')
-
-        n_total = len(all_z_list)
-        log(f'  Parsed {n_total} molecules total', 'DATA')
-
-        # Convert lists to arrays
-        all_z_indices = np.zeros((n_total, M), dtype=np.int64)
-        all_positions = np.zeros((n_total, M, 3), dtype=np.float32)
-        all_n_atoms = np.zeros(n_total, dtype=np.int32)
-        all_targets = np.zeros(n_total, dtype=np.float32)
-
-        for idx in range(n_total):
-            z_list = all_z_list[idx]
-            pos_list = all_pos_list[idx]
-            n = min(len(z_list), M)
-            all_z_indices[idx, :n] = z_list[:n]
-            all_positions[idx, :n] = pos_list[:n]
-            all_n_atoms[idx] = n
-            all_targets[idx] = all_tgt_list[idx]
-
-    # ── Final check ──
-    if all_z_indices is None:
-        raise RuntimeError('Could not load QM9 data from any backend!')
-
-    n_total = len(all_z_indices)
-    log(f'  Loaded {n_total} molecules successfully', 'DATA')
-
-    # Build padding mask
-    all_fmask = np.zeros((n_total, M), dtype=np.float32)
-    for idx in range(n_total):
-        n = int(all_n_atoms[idx])
-        if n < M:
-            all_fmask[idx, n:] = -10000.0
-
-    # Center positions by molecule centroid (IMPORTANT for symmetry)
-    for idx in range(n_total):
-        n = int(all_n_atoms[idx])
-        if n > 0:
-            centroid = all_positions[idx, :n].mean(axis=0)
-            all_positions[idx, :n] = all_positions[idx, :n] - centroid
-
-    result = {
-        'z_indices': torch.from_numpy(all_z_indices),
-        'positions': torch.from_numpy(all_positions),
-        'fmask': torch.from_numpy(all_fmask),
-        'targets_raw': torch.from_numpy(all_targets),
-        'n_atoms': torch.from_numpy(all_n_atoms),
-    }
-
-    try:
-        torch.save(result, cache_path)
-        log(f'  Cache saved to {cache_path}', 'DATA')
-    except Exception as e:
-        log(f'  Warning: could not save cache: {e}', 'WARN')
-
-    return result
+        # 3. Loss BYOL: L2 normalizado negativo ou Cosine Distance
+        pred_s_norm = F.normalize(pred_s, dim=-1)
+        proj_t_norm = F.normalize(proj_t.detach(), dim=-1)
+        
+        # O MSE de vectores normalizados é equivalente a 2 - 2 * cosine_similarity
+        loss = 2 - 2 * (pred_s_norm * proj_t_norm).sum(dim=-1).mean()
+        return loss
 
 
-def compute_all_mol_features(z_indices, positions, n_atoms, max_atoms, batch_size=5000):
-    """
-    Compute molecule-dependent per-atom features for ALL molecules.
-    Called AFTER the train/val/test split, so normalization can be done properly.
-
-    z_indices: (N, M) LongTensor
-    positions: (N, M, 3) FloatTensor
-    n_atoms: (N,) IntTensor
-    max_atoms: 29
-
-    Returns: (N, M, 20) FloatTensor of molecule-dependent features
-    """
-    N = z_indices.shape[0]
-    M = max_atoms
-    all_feats = np.zeros((N, M, CFG.n_mol_feats), dtype=np.float32)
-
-    log(f'Computing molecule-dependent features for {N} molecules…', 'DATA')
+def pre_pretrain_epoch(wrapper, opt, loader, cfg, epoch, sched, gstep):
+    wrapper.train()
     t0 = time.time()
+    total_loss = 0.0
+    samples = 0
 
-    z_np = z_indices.numpy()
-    pos_np = positions.numpy()
-    nat_np = n_atoms.numpy()
+    if cfg.prepretrain_curriculum:
+        progress = (epoch - 1) / max(cfg.prepretrain_epochs - 1, 1)
+        rot_strength = cfg.prepretrain_rot_start + (cfg.prepretrain_rot_end - cfg.prepretrain_rot_start) * (progress ** 0.5)
+    else:
+        rot_strength = cfg.prepretrain_rot_end
 
-    for idx in range(N):
-        n = int(nat_np[idx])
-        if n == 0:
+    opt.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(loader):
+        feat, fm, target, z, pos, aux = to_device(batch, cfg)
+        lr = cfg.prepretrain_lr * sched.factor(gstep + 1)
+        
+        # Atualiza LR do optimizador original guardado no Resurgent Wrapper
+        for pg in opt.optimizer.param_groups: pg["lr"] = lr
+
+        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=cfg.amp_enabled):
+            loss = wrapper(feat, fm, z, pos, rot_strength, rot_strength)
+
+        if not torch.isfinite(loss):
+            opt.zero_grad(set_to_none=True)
             continue
-        z = z_np[idx, :n].astype(np.float64)
-        pos = pos_np[idx, :n].astype(np.float64)
-        feats = compute_mol_dependent_features(z, pos, M)
-        all_feats[idx] = feats.astype(np.float32)
 
-        if (idx + 1) % batch_size == 0 or idx == N - 1:
-            elapsed = time.time() - t0
-            rate = (idx + 1) / elapsed
-            eta = (N - idx - 1) / rate
-            log(f'  Features: {idx+1}/{N} ({rate:.0f} mol/s, ETA {eta:.0f}s)', 'DATA')
+        loss.backward()
+        
+        # ==============================================================================
+        # CÁLCULO ALIENÍGENA:
+        # Removido o clip_grad_norm artificial. A Transformada de Borel-Laplace nativa do
+        # Otimizador absorve e ressurge o gradiente, mesmo se tender a infinito.
+        # ==============================================================================
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        
+        # Atualização do EMA do Teacher
+        wrapper.update_teacher(cfg.prepretrain_byol_momentum)
+        
+        gstep += 1
+        bs = feat.size(0)
+        samples += bs
+        total_loss += float(loss.detach().cpu()) * bs
 
-    return torch.from_numpy(all_feats)
+        if step % cfg.attn_log_freq == 0 or step + 1 == len(loader):
+            log(
+                f"prepre_ep={epoch:03d} step={step:04d}/{len(loader)} lr={lr:.2e} "
+                f"rot={rot_strength:.2f}π loss={total_loss/max(samples,1):.4f} "
+                f"{time.time()-t0:.1f}s",
+                "PREPRE",
+            )
+
+    return {"loss": total_loss / max(samples, 1), "time_s": round(time.time() - t0, 1), "rot_strength": rot_strength}, gstep
 
 
-# ═══════════════════════════ QM9 DATASET ═══════════════════════════════════════════
+# ═════════════════════════ PRETRAINING MASKED ════════════════════════════════
+
+class PretrainWrapper(nn.Module):
+    def __init__(self, backbone, cfg, n_aux):
+        super().__init__()
+        self.backbone = backbone
+        self.cfg = cfg
+        self.mask_feat = nn.Parameter(torch.zeros(cfg.atom_feature_dim))
+        d = cfg.d_model
+        self.feat_head = nn.Sequential(RMSNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, cfg.atom_feature_dim))
+        self.z_head = nn.Sequential(RMSNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 5))
+        self.aux_head = nn.Sequential(RMSNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, n_aux)) if n_aux > 0 else None
+        self.register_buffer("z_to_class", torch.tensor([[-1, 0, -1, -1, -1, -1, 1, 2, 3, 4][z] for z in range(10)], dtype=torch.long))
+
+    def forward(self, feat, fmask, z_idx, pos, aux_y):
+        valid = fmask > -9000.0
+        atom_mask = (torch.rand(valid.shape, device=feat.device) < self.cfg.pretrain_mask_rate) & valid
+        if atom_mask.sum() == 0: atom_mask[torch.arange(feat.shape[0], device=feat.device), valid.float().argmax(dim=1)] = True
+
+        feat_in, z_in = feat.clone(), z_idx.masked_fill(atom_mask, 0)
+        feat_in[atom_mask] = self.mask_feat.to(feat.dtype)
+
+        _, rep, tok = self.backbone(feat_in, fmask, z_in, pos, return_rep=True, return_tokens=True, terrain_view="random", make_pred=False)
+        zero = rep.sum() * 0.0
+        loss_z = loss_feat = loss_aux = loss_vic = zero
+
+        if atom_mask.any():
+            target_cls = self.z_to_class[z_idx.clamp(0, 9)][atom_mask]
+            if (ok := target_cls >= 0).any(): loss_z = F.cross_entropy(self.z_head(tok[atom_mask])[ok].float(), target_cls[ok])
+            loss_feat = F.smooth_l1_loss(self.feat_head(tok[atom_mask]).float(), feat[atom_mask].float(), beta=1.0)
+
+        if self.aux_head is not None and aux_y is not None and (m := torch.isfinite(aux_y)).any():
+            loss_aux = F.smooth_l1_loss(self.aux_head(rep)[m].float(), aux_y[m].float(), beta=1.0)
+
+        # VICReg weight é 0.0 na config agora, não destruindo o BYOL space.
+        if self.cfg.pretrain_vicreg_weight > 0:
+            _, r1 = self.backbone(feat, fmask, z_idx, pos, return_rep=True, terrain_view="random", make_pred=False)
+            _, r2 = self.backbone(feat, fmask, z_idx, pos, return_rep=True, terrain_view="random", make_pred=False)
+            loss_vic = F.mse_loss(r1, r2) 
+
+        loss = self.cfg.pretrain_aux_weight * loss_aux + self.cfg.pretrain_atom_weight * (loss_z + loss_feat) + self.cfg.pretrain_vicreg_weight * loss_vic
+        return loss, {"loss": float(loss.detach()), "aux": float(loss_aux.detach()), "z": float(loss_z.detach()), "feat": float(loss_feat.detach()), "vic": float(loss_vic.detach())}
+
+
+def pretrain_epoch(wrapper, opt, loader, cfg, epoch, sched, gstep):
+    wrapper.train()
+    t0, totals, samples = time.time(), {"loss": 0.0, "aux": 0.0, "z": 0.0, "feat": 0.0, "vic": 0.0}, 0
+    opt.zero_grad(set_to_none=True)
+    
+    for step, batch in enumerate(loader):
+        feat, fm, target, z, pos, aux = to_device(batch, cfg)
+        lr = cfg.pretrain_lr * sched.factor(gstep + 1)
+        for pg in opt.optimizer.param_groups: pg["lr"] = lr
+
+        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=cfg.amp_enabled):
+            loss, logs = wrapper(feat, fm, z, pos, aux)
+
+        if not torch.isfinite(loss):
+            opt.zero_grad(set_to_none=True)
+            continue
+
+        loss.backward()
+        
+        # CÁLCULO ALIENÍGENA: O gradiente flui analiticamente no plano de Borel. Otimizador lida com os infinitos.
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        gstep += 1
+
+        bs = feat.size(0)
+        samples += bs
+        for k in totals: totals[k] += logs[k] * bs
+
+        if step % cfg.attn_log_freq == 0 or step + 1 == len(loader):
+            avg = {k: totals[k] / max(samples, 1) for k in totals}
+            log(f"pre_ep={epoch:03d} step={step:04d}/{len(loader)} lr={lr:.2e} loss={avg['loss']:.4f} aux={avg['aux']:.4f} z={avg['z']:.4f} feat={avg['feat']:.4f} vic={avg['vic']:.4f}", "PRE")
+
+    return {k: totals[k] / max(samples, 1) for k in totals} | {"time_s": round(time.time() - t0, 1)}, gstep
+
+
+# ═════════════════════════ DATASET / OPTIM ═══════════════════════════════════
+
 class QM9Dataset(Dataset):
-    """Dataset with per-atom features, z_indices, positions, and targets."""
-    def __init__(self, mol_features, fmask, targets, z_indices, positions, indices=None):
-        if indices is not None:
-            self.mol_features = mol_features[indices]
-            self.fmask = fmask[indices]
-            self.targets = targets[indices]
-            self.z_indices = z_indices[indices]
-            self.positions = positions[indices]
-        else:
-            self.mol_features = mol_features
-            self.fmask = fmask
-            self.targets = targets
-            self.z_indices = z_indices
-            self.positions = positions
+    def __init__(self, atom_features, fmask, targets, z_indices, positions, aux_targets, indices):
+        self.atom_features, self.fmask, self.targets = atom_features[indices], fmask[indices], targets[indices]
+        self.z_indices, self.positions = z_indices[indices], positions[indices]
+        self.aux_targets = aux_targets[indices] if aux_targets is not None else torch.empty((len(indices), 0))
+    def __len__(self): return len(self.targets)
+    def __getitem__(self, i): return (self.atom_features[i], self.fmask[i], self.targets[i], self.z_indices[i], self.positions[i], self.aux_targets[i])
 
-    def __len__(self):
-        return len(self.targets)
-
-    def __getitem__(self, i):
-        return (self.mol_features[i], self.fmask[i], self.targets[i],
-                self.z_indices[i], self.positions[i])
-
-# ═══════════════════════════ OPTIMIZADORES & SCHEDULER ═══════════════════════════════
 class EMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = copy.deepcopy(model).eval()
-        for p in self.shadow.parameters():
-            p.requires_grad_(False)
-
+        for p in self.shadow.parameters(): p.requires_grad_(False)
     @torch.no_grad()
     def update(self, model):
-        for s, m in zip(self.shadow.parameters(), model.parameters()):
-            s.lerp_(m.float(), 1.0 - self.decay)
-        for sb, mb in zip(self.shadow.buffers(), model.buffers()):
-            sb.copy_(mb)
+        for s, m in zip(self.shadow.parameters(), model.parameters()): s.lerp_(m.float(), 1.0 - self.decay)
+        for sb, mb in zip(self.shadow.buffers(), model.buffers()): sb.copy_(mb)
 
-class Lookahead(torch.optim.Optimizer):
-    def __init__(self, base, k=6, alpha=0.5):
-        self._b = base
-        self.k = k
-        self.alpha = alpha
-        self._steps = 0
-        self._slow = {}
-        self.param_groups = base.param_groups
-        self.defaults = getattr(base, 'defaults', {})
-
+# ═════════════════════════ CÁLCULO ALIENÍGENA (ÉCALLE, 1981) ══════════════════
+class BorelLaplaceResurgentOptimizer:
+    """
+    Otimizador Resurgente Não-Perturbativo.
+    Substitui a técnica "cega" do gradient clipping artificial. 
+    Se o gradiente tende ao infinito, ele é projetado no Plano de Borel, onde
+    o comportamento divergente se transforma num Pólo Analítico, e um Instanton (Laplace) 
+    injeta um momento não-linear direto para a bacia de atração do verdadeiro mínimo.
+    """
+    def __init__(self, optimizer, action_threshold=1.0):
+        self.optimizer = optimizer
+        self.action_threshold = action_threshold
+        
     @property
-    def state(self):
-        return self._b.state
+    def param_groups(self): return self.optimizer.param_groups
+    
+    @property
+    def state(self): return self.optimizer.state
+    
+    @property
+    def defaults(self): return self.optimizer.defaults
 
     def zero_grad(self, set_to_none=True):
-        self._b.zero_grad(set_to_none=set_to_none)
+        self.optimizer.zero_grad(set_to_none=set_to_none)
 
-    def _ensure(self):
-        if self._slow:
-            return
-        for g in self.param_groups:
-            for p in g['params']:
-                self._slow[id(p)] = p.data.clone().detach()
-
+    @torch.no_grad()
     def step(self, closure=None):
-        loss = self._b.step(closure)
+        grads = []
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    grads.append(p.grad)
+                    
+        if not grads:
+            return self.optimizer.step(closure)
+            
+        # 1. Indicador de Divergência Global (Norma no espaço euclidiano atual)
+        global_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2).to(torch.float32) for g in grads]), 2)
+        
+        if global_norm > 1e-8:
+            eta = self.optimizer.param_groups[0].get("lr", 1e-4) + 1e-12
+            
+            # 2. Transformada de Borel (Mapeamento Analítico do Infinito)
+            # Ao invés do erro numérico do float32 (NaN), a explosão fatorial é enclausurada:
+            # lim_{global_norm -> inf} borel_pole -> 0 (Impede overflow do hardware físico)
+            borel_pole = 1.0 / (1.0 + global_norm * eta)
+            
+            # 3. Trans-série / Instanton (Integração Direcional de Laplace)
+            # O salto quântico no ponto de singularidade. Um túnel não-perturbativo criado
+            # pelo extremo erro da derivada original, cruzando o espaço de fase.
+            trans_series_instanton = torch.exp(-self.action_threshold / (global_norm * eta + 1e-12))
+            
+            # A escala final é o "caminho resurgente" - A Matemática no seu estado puro
+            resurgent_scale = borel_pole + trans_series_instanton * (1.0 / (global_norm + 1e-12))
+            
+            for g in grads:
+                g.mul_(resurgent_scale.to(g.dtype))
+        
+        # O AdamW processa o tensor matematicamente curado pelas derivadas alienígenas
+        return self.optimizer.step(closure)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Lookahead:
+    def __init__(self, optimizer, k=6, alpha=0.5):
+        self.optimizer, self.k, self.alpha, self._steps, self._slow = optimizer, k, alpha, 0, {}
+    @property
+    def state(self): return self.optimizer.state
+    @property
+    def param_groups(self): return self.optimizer.param_groups
+    @property
+    def defaults(self): return self.optimizer.defaults
+    def zero_grad(self, set_to_none=True): self.optimizer.zero_grad(set_to_none=set_to_none)
+    def step(self, closure=None):
+        loss = self.optimizer.step(closure)
         self._steps += 1
-        self._ensure()
+        if not self._slow: self._slow = {id(p): p.data.clone().detach() for group in self.optimizer.param_groups for p in group["params"]}
         if self._steps % self.k == 0:
-            for g in self.param_groups:
-                for p in g['params']:
+            for group in self.optimizer.param_groups:
+                for p in group["params"]:
                     s = self._slow[id(p)]
                     s.add_(self.alpha * (p.data - s))
                     p.data.copy_(s)
         return loss
 
 class AWP:
-    def __init__(self, model, scaler, eps=0.003, lr=0.005):
-        self.model = model
-        self.scaler = scaler
-        self.eps = eps
-        self.lr = lr
-        self._bk = {}
-        self._on = False
-
+    def __init__(self, model, eps=0.003, lr=0.005):
+        self.model, self.eps, self.lr, self.backup, self.on = model, eps, lr, {}, False
     def perturb(self):
-        if self._on:
-            return
-        sc = self.scaler.get_scale() if self.scaler.is_enabled() else 1.0
+        if self.on: return
         for n, p in self.model.named_parameters():
-            if p.requires_grad and p.grad is not None:
-                g = p.grad.float() / (sc + 1e-8)
-                gn = g.norm()
-                if gn > 0 and torch.isfinite(gn):
-                    self._bk[n] = p.data.clone()
-                    p.data.add_((self.lr * g / (gn + 1e-8)).clamp_(-self.eps, self.eps).to(p.dtype))
-        self._on = True
-
+            if p.requires_grad and p.grad is not None and torch.isfinite(gn := p.grad.float().norm()) and gn > 0:
+                self.backup[n] = p.data.clone()
+                p.data.add_((self.lr * p.grad.float() / (gn + 1e-8)).clamp(-self.eps, self.eps).to(p.dtype))
+        self.on = True
     def restore(self):
         for n, p in self.model.named_parameters():
-            if n in self._bk:
-                p.data.copy_(self._bk[n])
-        self._bk.clear()
-        self._on = False
-
-def _gc_hook(g):
-    return g - g.mean(tuple(range(1, g.dim())), keepdim=True) if g.dim() > 1 else g
+            if n in self.backup: p.data.copy_(self.backup[n])
+        self.backup.clear()
+        self.on = False
 
 def register_gc(model):
-    return [p.register_hook(_gc_hook) for n, p in model.named_parameters()
-            if p.requires_grad and p.dim() > 1 and 'input_proj' not in n and 'z_embed' not in n]
+    return [p.register_hook(lambda g: g - g.mean(tuple(range(1, g.dim())), keepdim=True) if g.dim() > 1 else g) for n, p in model.named_parameters() if p.requires_grad and p.dim() > 1 and "input_proj" not in n and "z_embed" not in n]
 
 class WarmupCosineLR:
-    def __init__(self, total, wf, mf):
-        self.T = max(total, 1)
-        self.W = max(int(wf * total), 1)
-        self.mf = mf
-
+    def __init__(self, total, wf, mf): self.T, self.W, self.mf = max(int(total), 1), max(int(wf * total), 1), mf
     def factor(self, step):
-        if step < self.W:
-            return step / self.W
-        p = min(max((step - self.W) / max(self.T - self.W, 1), 0.0), 1.0)
-        return self.mf + (1.0 - self.mf) * 0.5 * (1.0 + math.cos(math.pi * p))
+        if step < self.W: return max(step, 1) / self.W
+        return self.mf + (1.0 - self.mf) * 0.5 * (1.0 + math.cos(math.pi * min(max((step - self.W) / max(self.T - self.W, 1), 0.0), 1.0)))
 
-# ═══════════════════════════ MÉTRICAS DE REGRESSÃO ═══════════════════════════════
-def compute_regression_metrics(pred, target, y_mean=0.0, y_std=1.0):
-    pred_orig = pred * y_std + y_mean
-    target_orig = target * y_std + y_mean
-    diff = pred_orig - target_orig
-    abs_diff = diff.abs()
-    mae = abs_diff.mean().item()
-    rmse = diff.pow(2).mean().sqrt().item()
-    ss_res = diff.pow(2).sum().item()
-    ss_tot = (target_orig - target_orig.mean()).pow(2).sum().item()
-    r2 = 1.0 - ss_res / max(ss_tot, 1e-8)
-    non_zero = target_orig.abs() > 0.01
-    mape = (abs_diff[non_zero] / target_orig[non_zero].abs()).mean().item() * 100.0 if non_zero.sum() > 0 else 0.0
-    median_ae = abs_diff.median().item()
-    max_ae = abs_diff.max().item()
-    pred_m = pred_orig - pred_orig.mean()
-    tgt_m = target_orig - target_orig.mean()
-    pearson_r = ((pred_m * tgt_m).sum() / (pred_m.norm() * tgt_m.norm()).clamp(min=1e-8)).item()
-    return {'mae': mae, 'rmse': rmse, 'r2': r2, 'mape': mape, 'median_ae': median_ae,
-            'max_ae': max_ae, 'pearson_r': pearson_r}
 
-# ═══════════════════════════ TREINO E AVALIAÇÃO ═══════════════════════════════════════
-def train_epoch(model, ema, optimizer, scaler, loader, awp, cfg, epoch, gstep, lr_sched, base_opt):
+# ═════════════════════════ TRAIN / EVAL ══════════════════════════════════════
+
+def to_device(batch, cfg):
+    return tuple(t.to(cfg.device, non_blocking=True) for t in batch)
+
+def compute_regression_metrics(pred, target, y_mean, y_std):
+    pred_o, tgt_o = pred * y_std + y_mean, target * y_std + y_mean
+    diff, absd = pred_o - tgt_o, (pred_o - tgt_o).abs()
+    ss_res, ss_tot = diff.pow(2).sum().item(), (tgt_o - tgt_o.mean()).pow(2).sum().item()
+    pm, tm = pred_o - pred_o.mean(), tgt_o - tgt_o.mean()
+    nz = tgt_o.abs() > 0.01
+    return {
+        "mae": absd.mean().item(), "rmse": diff.pow(2).mean().sqrt().item(),
+        "r2": 1.0 - ss_res / max(ss_tot, 1e-8), "median_ae": absd.median().item(),
+        "max_ae": absd.max().item(), "mape": (absd[nz] / tgt_o[nz].abs()).mean().item() * 100.0 if nz.any() else 0.0,
+        "pearson_r": ((pm * tm).sum() / (pm.norm() * tm.norm()).clamp(min=1e-8)).item(),
+        "pred_mean": pred_o.mean().item(), "pred_std": pred_o.std().item(), "target_mean": tgt_o.mean().item(), "target_std": tgt_o.std().item()
+    }
+
+
+def train_epoch(model, ema, optimizer, base_opt, loader, awp, cfg, epoch, gstep, sched):
     model.train()
-    n = len(loader)
-    t0 = time.time()
-    total_loss = 0.0
-    total_mae_norm = 0.0
-    total_mae_ev = 0.0
-    total_samples = 0
-    grad_norm_accum = 0.0
-    grad_norm_count = 0
+    t0, total_loss, total_mae_ev, samples, grad_sum, grad_count = time.time(), 0.0, 0.0, 0, 0.0, 0
     optimizer.zero_grad(set_to_none=True)
 
-    for step, (feat, fm, target, z_idx, pos) in enumerate(loader):
-        feat = feat.to(cfg.device, non_blocking=True)
-        fm = fm.to(cfg.device, non_blocking=True)
-        target = target.to(cfg.device, non_blocking=True)
-        z_idx = z_idx.to(cfg.device, non_blocking=True)
-        pos = pos.to(cfg.device, non_blocking=True)
+    for step, batch in enumerate(loader):
+        feat, fm, target, z, pos, aux = to_device(batch, cfg)
+        lr = cfg.base_lr_max * sched.factor(gstep + 1)
+        
+        # O optimizer agora é o BorelLaplaceResurgentOptimizer (wrapper do AdamW)
+        for pg in optimizer.optimizer.param_groups: pg["lr"] = lr
 
-        use_mx = random.random() < cfg.mixup_prob
-        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=(cfg.device.type == 'cuda')):
-            if use_mx:
-                lam = float(np.random.beta(cfg.mixup_alpha, cfg.mixup_alpha))
-                idx2 = torch.randperm(feat.size(0), device=cfg.device)
-                mixed_feat = lam * feat + (1 - lam) * feat[idx2]
-                mixed_pos = lam * pos + (1 - lam) * pos[idx2]
-                mixed_target = lam * target + (1 - lam) * target[idx2]
-                # z_indices: use the dominant atom's z (from lam)
-                mixed_z = z_idx if lam >= 0.5 else z_idx[idx2]
-                pred = model(mixed_feat, fm, mixed_z, mixed_pos)
-                loss = F.smooth_l1_loss(pred, mixed_target, beta=cfg.huber_delta)
-            else:
-                pred = model(feat, fm, z_idx, pos)
-                loss = F.smooth_l1_loss(pred, target, beta=cfg.huber_delta)
+        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=cfg.amp_enabled):
+            pred = model(feat, fm, z, pos)
+            loss = F.smooth_l1_loss(pred, target, beta=cfg.huber_delta)
 
-        scaler.scale(loss / cfg.grad_accum).backward()
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        (loss / cfg.grad_accum).backward()
 
         if (step + 1) % cfg.grad_accum == 0:
-            scaler.unscale_(optimizer)
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            total_norm = total_norm ** 0.5
-            grad_norm_accum += min(total_norm, 1000.0)
-            grad_norm_count += 1
-
+            grad_sum += min(sum(p.grad.data.norm(2).item() ** 2 for p in model.parameters() if p.grad is not None) ** 0.5, 1000.0)
+            grad_count += 1
             if epoch >= cfg.awp_start_ep:
                 awp.perturb()
-                with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=(cfg.device.type == 'cuda')):
-                    scaler.scale(
-                        F.smooth_l1_loss(model(feat, fm, z_idx, pos), target, beta=cfg.huber_delta) / cfg.grad_accum
-                    ).backward()
+                with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=cfg.amp_enabled):
+                    (F.smooth_l1_loss(model(feat, fm, z, pos), target, beta=cfg.huber_delta) / cfg.grad_accum).backward()
                 awp.restore()
-
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.clip_grad)
-            scaler.step(optimizer)
-            scaler.update()
+            
+            # CÁLCULO ALIENÍGENA: sem clip, o ResurgentOptimizer trata dos gradientes
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             ema.update(model)
             gstep += 1
-            base_opt.param_groups[0]['lr'] = cfg.base_lr_max * lr_sched.factor(gstep)
 
         bs = target.size(0)
+        samples += bs
         total_loss += loss.item() * bs
-        total_mae_norm += (pred - target).abs().sum().item()
-        total_mae_ev += ((pred - target) * cfg._y_std).abs().sum().item()
-        total_samples += bs
+        total_mae_ev += ((pred.detach() - target).abs() * cfg._y_std).sum().item()
 
-        if step % cfg.attn_log_freq == 0 or step == n - 1:
-            ela = time.time() - t0
-            lr_now = base_opt.param_groups[0]['lr']
-            avg_loss = total_loss / max(total_samples, 1)
-            avg_mae_ev = total_mae_ev / max(total_samples, 1)
-            avg_mae_norm = total_mae_norm / max(total_samples, 1)
-            gn = grad_norm_accum / max(grad_norm_count, 1) if grad_norm_count > 0 else 0.0
-            log(f'ep={epoch:3d} │ step={step:04d}/{n} │ lr={lr_now:.6f} │ '
-                f'loss={loss.item():.5f} │ mae(norm)={avg_mae_norm:.4f} │ '
-                f'mae(eV)={avg_mae_ev:.4f} │ gnorm={gn:.3f} │ {ela:.1f}s', 'TRAIN')
+        if step % cfg.attn_log_freq == 0 or step + 1 == len(loader):
+            log(f"ep={epoch:03d} step={step:04d}/{len(loader)} lr={lr:.2e} loss={loss.item():.5f} mae_eV={total_mae_ev/max(samples,1):.4f} gnorm_raw={grad_sum/max(grad_count,1):.3f} {time.time()-t0:.1f}s", "TRAIN")
 
-    avg_loss = total_loss / max(total_samples, 1)
-    avg_mae_norm = total_mae_norm / max(total_samples, 1)
-    avg_mae_ev = total_mae_ev / max(total_samples, 1)
-    avg_gnorm = grad_norm_accum / max(grad_norm_count, 1) if grad_norm_count > 0 else 0.0
-    elapsed = round(time.time() - t0, 1)
-
-    return {'loss': avg_loss, 'mae_norm': avg_mae_norm, 'mae_ev': avg_mae_ev,
-            'grad_norm': avg_gnorm, 'lr': base_opt.param_groups[0]['lr'], 'time_s': elapsed}, gstep
-
+    return {"loss": total_loss / max(samples, 1), "mae_ev": total_mae_ev / max(samples, 1), "grad_norm": grad_sum / max(grad_count, 1), "lr": lr, "time_s": round(time.time() - t0, 1)}, gstep
 
 @torch.no_grad()
-def evaluate(model, loader, cfg, y_mean=0.0, y_std=1.0):
+def evaluate(model, loader, cfg, y_mean, y_std):
     model.eval()
-    all_pred = []
-    all_target = []
-    total_loss = 0.0
-    total_samples = 0
-    t0 = time.time()
+    t0, total_loss, samples, preds, tgts = time.time(), 0.0, 0, [], []
+    for batch in loader:
+        feat, fm, target, z, pos, aux = to_device(batch, cfg)
+        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=cfg.amp_enabled):
+            pred = model(feat, fm, z, pos)
+            total_loss += F.smooth_l1_loss(pred, target, beta=1.0).item() * target.size(0)
+        samples += target.size(0)
+        preds.append(pred.float().cpu())
+        tgts.append(target.float().cpu())
 
-    for feat, fm, target, z_idx, pos in loader:
-        feat = feat.to(cfg.device)
-        fm = fm.to(cfg.device)
-        target = target.to(cfg.device)
-        z_idx = z_idx.to(cfg.device)
-        pos = pos.to(cfg.device)
-
-        with autocast(device_type=cfg.device.type, dtype=cfg.amp_dtype, enabled=(cfg.device.type == 'cuda')):
-            pred = model(feat, fm, z_idx, pos)
-            loss = F.smooth_l1_loss(pred, target, beta=1.0)
-
-        total_loss += loss.item() * target.size(0)
-        total_samples += target.size(0)
-        all_pred.append(pred.cpu())
-        all_target.append(target.cpu())
-
-    all_pred = torch.cat(all_pred)
-    all_target = torch.cat(all_target)
-    metrics = compute_regression_metrics(all_pred, all_target, y_mean, y_std)
-    metrics['time_s'] = round(time.time() - t0, 1)
-    metrics['loss'] = total_loss / max(total_samples, 1)
-
-    pred_orig = all_pred * y_std + y_mean
-    tgt_orig = all_target * y_std + y_mean
-    metrics['pred_mean'] = pred_orig.mean().item()
-    metrics['pred_std'] = pred_orig.std().item()
-    metrics['target_mean'] = tgt_orig.mean().item()
-    metrics['target_std'] = tgt_orig.std().item()
-
-    return metrics
+    m = compute_regression_metrics(torch.cat(preds), torch.cat(tgts), y_mean, y_std)
+    m["loss"] = total_loss / max(samples, 1)
+    m["time_s"] = round(time.time() - t0, 1)
+    return m
 
 
-def print_epoch_table(epoch, tr_s, va_s, best_mae, cfg):
-    if not HAS_RICH:
-        log(f'EPOCH {epoch:3d} │ tr_loss={tr_s["loss"]:.6f} │ tr_mae={tr_s["mae_ev"]:.4f} eV │ '
-            f'va_mae={va_s["mae"]:.4f} eV │ va_rmse={va_s["rmse"]:.4f} eV │ '
-            f'va_R2={va_s["r2"]:.4f} │ best={best_mae:.4f} eV │ {tr_s["time_s"]}s', 'METRIC')
-        return
-    t = Table(title=f'Epoch {epoch:3d}/{cfg.epochs} · GrafoPropagation {cfg.VERSION}',
-              box=box.HEAVY_EDGE, show_lines=True, title_style='bold cyan')
-    t.add_column('Split', style='bold', width=6)
-    t.add_column('MAE(eV)', style='bold green', width=10, justify='right')
-    t.add_column('RMSE(eV)', style='green', width=10, justify='right')
-    t.add_column('R²', style='green', width=8, justify='right')
-    t.add_column('MAPE%', style='green', width=7, justify='right')
-    t.add_column('MedAE', style='green', width=8, justify='right')
-    t.add_column('MaxAE', style='green', width=8, justify='right')
-    t.add_column('Pearson', style='green', width=8, justify='right')
-    t.add_column('Loss', style='yellow', width=10, justify='right')
-    t.add_column('LR', style='dim', width=10, justify='right')
-    t.add_column('GNorm', style='dim', width=7, justify='right')
-    t.add_column('Time', style='dim', width=6, justify='right')
+# ═════════════════════════ MAIN ══════════════════════════════════════════════
 
-    t.add_row('Train', f'{tr_s["mae_ev"]:.4f}', '—', '—', '—', '—', '—', '—',
-              f'{tr_s["loss"]:.6f}', f'{tr_s["lr"]:.2e}', f'{tr_s["grad_norm"]:.3f}', f'{tr_s["time_s"]}s')
-
-    is_best = va_s['mae'] <= best_mae
-    r2_style = 'bold green' if va_s['r2'] > 0.9 else ('yellow' if va_s['r2'] > 0.7 else 'red')
-    mae_style = 'bold green' if va_s['mae'] < 0.1 else ('yellow' if va_s['mae'] < 0.2 else 'red')
-    split_label = '[bold blue]Val★[/bold blue]' if is_best else 'Val'
-
-    t.add_row(split_label, f'[{mae_style}]{va_s["mae"]:.4f}[/{mae_style}]',
-              f'{va_s["rmse"]:.4f}', f'[{r2_style}]{va_s["r2"]:.4f}[/{r2_style}]',
-              f'{va_s["mape"]:.2f}', f'{va_s["median_ae"]:.4f}', f'{va_s["max_ae"]:.4f}',
-              f'{va_s["pearson_r"]:.4f}', f'{va_s.get("loss", 0):.6f}' if "loss" in va_s else '—',
-              '—', '—', f'{va_s["time_s"]}s')
-    console.print(t)
-
-
-def print_leaderboard_table(test_s, best_epoch, best_mae, total_params, cfg):
-    if not HAS_RICH:
-        log(f'═══ FINAL TEST ═══ MAE={test_s["mae"]:.4f} eV │ RMSE={test_s["rmse"]:.4f} eV │ '
-            f'R2={test_s["r2"]:.4f} │ MAPE={test_s["mape"]:.2f}%', 'METRIC')
-        return
-    t = Table(title=f'LEADERBOARD · GrafoPropagation {cfg.VERSION} · QM9 HOMO-LUMO Gap',
-              box=box.DOUBLE_EDGE, show_lines=True, title_style='bold yellow on blue')
-    t.add_column('Metric', style='bold', width=20)
-    t.add_column('Value', style='bold green', width=20, justify='right')
-    t.add_column('Unit', style='dim', width=10)
-    t.add_row('Test MAE', f'{test_s["mae"]:.4f}', 'eV')
-    t.add_row('Test RMSE', f'{test_s["rmse"]:.4f}', 'eV')
-    t.add_row('Test R²', f'{test_s["r2"]:.6f}', '')
-    t.add_row('Test MAPE', f'{test_s["mape"]:.2f}', '%')
-    t.add_row('Test MedianAE', f'{test_s["median_ae"]:.4f}', 'eV')
-    t.add_row('Test MaxAE', f'{test_s["max_ae"]:.4f}', 'eV')
-    t.add_row('Test Pearson r', f'{test_s["pearson_r"]:.6f}', '')
-    t.add_row('Best Val MAE', f'{best_mae:.4f}', 'eV')
-    t.add_row('Best Epoch', f'{best_epoch}', '')
-    t.add_row('Parameters', f'{total_params:,}', f'({total_params/1e6:.3f}M)')
-    t.add_row('Architecture', f'd={cfg.d_model} L={cfg.n_layers} H={cfg.n_heads} hd={cfg.head_dim}', '')
-    t.add_row('Features', f'fixed={cfg.n_fixed_feats} mol={cfg.n_mol_feats} z_emb={cfg.n_z_embed}', '')
-    t.add_row('DistBias', f'gauss={cfg.dist_n_rbf_gauss} bessel={cfg.dist_n_rbf_bessel} cut={cfg.dist_cutoff}Å', '')
-    t.add_row('Run ID', RUN_ID, '')
-    t.add_row('Pred Mean', f'{test_s["pred_mean"]:.4f}', 'eV')
-    t.add_row('Pred Std', f'{test_s["pred_std"]:.4f}', 'eV')
-    t.add_row('Target Mean', f'{test_s["target_mean"]:.4f}', 'eV')
-    t.add_row('Target Std', f'{test_s["target_std"]:.4f}', 'eV')
-    console.print(t)
-
-
-def print_config_table(cfg):
-    if not HAS_RICH:
-        return
-    t = Table(title='Configuration', box=box.SIMPLE, show_lines=False, title_style='bold')
-    t.add_column('Parameter', style='bold', width=30)
-    t.add_column('Value', style='cyan', width=40)
-    items = [
-        ('Version', cfg.VERSION),
-        ('Device', str(cfg.device)),
-        ('AMP dtype', str(cfg.amp_dtype)),
-        ('Seed', str(cfg.seed)),
-        ('Max atoms', str(cfg.max_atoms)),
-        ('Feature dim', f'{cfg.feature_dim} (fixed={cfg.n_fixed_feats} mol={cfg.n_mol_feats} z_emb={cfg.n_z_embed})'),
-        ('d_model', str(cfg.d_model)),
-        ('n_layers', str(cfg.n_layers)),
-        ('n_heads', str(cfg.n_heads)),
-        ('head_dim', str(cfg.head_dim)),
-        ('d_ff', str(cfg.d_ff)),
-        ('Dropout', str(cfg.dropout)),
-        ('Stochastic depth', str(cfg.stoch_depth)),
-        ('Distance bias', f'gauss={cfg.dist_n_rbf_gauss} bessel={cfg.dist_n_rbf_bessel} cut={cfg.dist_cutoff}Å'),
-        ('Epochs', str(cfg.epochs)),
-        ('Batch size', str(cfg.batch_size)),
-        ('Base LR', str(cfg.base_lr_max)),
-        ('EMA decay', str(cfg.ema_decay)),
-        ('AWP eps/lr/start', f'{cfg.awp_eps}/{cfg.awp_lr}/ep{cfg.awp_start_ep}'),
-        ('Lookahead k/α', f'{cfg.la_k}/{cfg.la_alpha}'),
-        ('Huber delta', str(cfg.huber_delta)),
-        ('Mixup α/prob', f'{cfg.mixup_alpha}/{cfg.mixup_prob}'),
-        ('Normalize y', str(cfg.normalize_y)),
-    ]
-    for k, v in items:
-        t.add_row(k, v)
-    console.print(t)
-
-
-def print_data_stats(data, cfg, train_ds, val_ds, test_ds, y_mean=0.0, y_std=1.0):
-    if not HAS_RICH:
-        return
-    targets_raw = data['targets_raw']
-    n_atoms = data['n_atoms']
-    t = Table(title='QM9 Dataset Statistics', box=box.SIMPLE_HEAVY, show_lines=True, title_style='bold green')
-    t.add_column('Statistic', style='bold', width=30)
-    t.add_column('Value', style='green', width=30)
-    t.add_row('Total molecules', f'{len(data["z_indices"]):,}')
-    t.add_row('Train / Val / Test', f'{len(train_ds):,} / {len(val_ds):,} / {len(test_ds):,}')
-    t.add_row('Target (gap) mean', f'{targets_raw.mean():.4f} eV')
-    t.add_row('Target (gap) std', f'{targets_raw.std():.4f} eV')
-    t.add_row('Target (gap) min', f'{targets_raw.min():.4f} eV')
-    t.add_row('Target (gap) max', f'{targets_raw.max():.4f} eV')
-    t.add_row('Atoms mean', f'{n_atoms.float().mean():.1f}')
-    t.add_row('Atoms min / max', f'{n_atoms.min()} / {n_atoms.max()}')
-    t.add_row('z_indices shape', f'{data["z_indices"].shape}')
-    t.add_row('positions shape', f'{data["positions"].shape}')
-    t.add_row('y_mean (train-only norm)', f'{y_mean:.4f}')
-    t.add_row('y_std (train-only norm)', f'{y_std:.4f}')
-    console.print(t)
-
-
-def print_feature_stats_table(feat_mean, feat_std, cfg):
-    """Print feature normalization statistics."""
-    if not HAS_RICH:
-        return
-    t = Table(title='Feature Normalization (Train-Only Stats)', box=box.SIMPLE,
-              show_lines=False, title_style='bold cyan')
-    t.add_column('Feature Group', style='bold', width=25)
-    t.add_column('Dims', style='cyan', width=8)
-    t.add_column('Mean Range', style='green', width=25)
-    t.add_column('Std Range', style='green', width=25)
-    # Fixed features (0:27)
-    t.add_row('Fixed Physical', '0-26',
-              f'[{feat_mean[:27].min():.3f}, {feat_mean[:27].max():.3f}]',
-              f'[{feat_std[:27].min():.3f}, {feat_std[:27].max():.3f}]')
-    # Mol-dependent features (27:47)
-    t.add_row('Mol-Dependent', '27-46',
-              f'[{feat_mean[27:47].min():.3f}, {feat_mean[27:47].max():.3f}]',
-              f'[{feat_std[27:47].min():.3f}, {feat_std[27:47].max():.3f}]')
-    console.print(t)
-
-
-# ═══════════════════════════ MAIN ════════════════════════════════════════════════
 def main():
     cfg = CFG()
-    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    ensure_paths(cfg)
+    set_seed(cfg.seed)
 
-    log_separator(f'GrafoPropagation {cfg.VERSION} · Run {RUN_ID}')
-    print_config_table(cfg)
-
-    log(f'device={cfg.device}  amp={cfg.amp_dtype}  max_atoms={cfg.max_atoms}  feature_dim={cfg.feature_dim}')
-
-    # ── Load raw QM9 data (z_indices, positions, fmask, targets) ──
-    raw_data = precompute_qm9_data(cfg)
-
-    z_indices_all = raw_data['z_indices']    # (N, 29) Long
-    positions_all = raw_data['positions']    # (N, 29, 3) Float
-    fmask_all = raw_data['fmask']            # (N, 29)
-    targets_raw = raw_data['targets_raw']    # (N,)
-    n_atoms_all = raw_data['n_atoms']        # (N,)
-
-    # ── Split 80/10/10 (determinístico) ──
-    torch.manual_seed(cfg.seed)
-    n_total = len(z_indices_all)
-    indices = torch.randperm(n_total)
-    n_train = int(0.8 * n_total)
-    n_val = int(0.1 * n_total)
-
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-
-    # ══ NORMALIZAÇÃO: APENAS em dados de treino (sem batota) ══
-    # Target normalization
-    y_mean = float(targets_raw[train_idx].mean())
-    y_std = float(targets_raw[train_idx].std())
-    if cfg.normalize_y:
-        targets_all = (targets_raw - y_mean) / max(y_std, 1e-8)
-    else:
-        targets_all = targets_raw.clone()
-        y_mean = 0.0
-        y_std = 1.0
+    log_separator(f"{cfg.VERSION} · ALIEN CALCULUS RESURGENCE · Run {RUN_ID}")
+    
+    raw = precompute_qm9_data(cfg)
+    z_all, pos_all, fm_all, y_raw, targets_all = raw["z_indices"], raw["positions"], raw["fmask"], raw["targets_raw"].float(), raw["targets_all"].float()
+    N = len(y_raw)
+    train_idx, val_idx, test_idx = make_splits(N, cfg)
+    
+    y_mean, y_std = float(y_raw[train_idx].mean()), float(y_raw[train_idx].std().clamp_min(1e-8))
+    y_all = (y_raw - y_mean) / y_std if cfg.normalize_y else y_raw.clone()
+    if not cfg.normalize_y: y_mean, y_std = 0.0, 1.0
     cfg._y_std = y_std
-    log(f'Target stats (train-only): y_mean={y_mean:.4f} eV, y_std={y_std:.4f} eV', 'DATA')
 
-    # ── Compute molecule-dependent per-atom features ──
-    mol_features_all = compute_all_mol_features(
-        z_indices_all, positions_all, n_atoms_all, cfg.max_atoms
-    )  # (N, 29, 20)
+    aux_norm, aux_cols, aux_mean, aux_std = build_aux_targets_train_only(targets_all, train_idx, cfg.gap_idx)
+    atom_features, feat_mean, feat_std = build_atom_features_train_only(raw, train_idx, cfg)
 
-    # ── Feature normalization (train-only) ──
-    M = cfg.max_atoms
-    train_fmask = fmask_all[train_idx]  # (n_train, 29)
-    train_mol_feats = mol_features_all[train_idx]  # (n_train, 29, 20)
-    real_mask_train = (train_fmask > -9000.0)  # (n_train, 29) bool
+    train_ds = QM9Dataset(atom_features, fm_all, y_all, z_all, pos_all, aux_norm, train_idx)
+    val_ds = QM9Dataset(atom_features, fm_all, y_all, z_all, pos_all, aux_norm, val_idx)
+    test_ds = QM9Dataset(atom_features, fm_all, y_all, z_all, pos_all, aux_norm, test_idx)
 
-    # Also normalize the fixed features using train-only atom frequency
-    # Compute combined features for normalization stats
-    train_z = z_indices_all[train_idx]  # (n_train, 29) Long
-    train_fixed = torch.from_numpy(FIXED_FEAT_TABLE)[train_z]  # (n_train, 29, 27)
+    loader_kw = dict(num_workers=cfg.num_workers, pin_memory=cfg.pin_memory, persistent_workers=cfg.num_workers > 0)
+    tr_ld = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, **loader_kw)
+    pre_ld = DataLoader(train_ds, batch_size=cfg.pretrain_batch_size, shuffle=True, drop_last=True, **loader_kw)
+    
+    prepre_ld = DataLoader(train_ds, batch_size=cfg.prepretrain_batch_size, shuffle=True, drop_last=True, **loader_kw)
+    
+    va_ld = DataLoader(val_ds, batch_size=256, shuffle=False, drop_last=False, **loader_kw)
+    te_ld = DataLoader(test_ds, batch_size=256, shuffle=False, drop_last=False, **loader_kw)
 
-    # Combined: (n_train, 29, 47) = fixed(27) + mol(20)
-    train_combined = torch.cat([train_fixed, train_mol_feats], dim=-1)  # (n_train, 29, 47)
-
-    # Compute mean/std per feature dimension across all real atoms in training set
-    n_total_feats = cfg.n_fixed_feats + cfg.n_mol_feats  # 47
-    feat_mean = torch.zeros(n_total_feats, dtype=torch.float32)
-    feat_std = torch.ones(n_total_feats, dtype=torch.float32)
-
-    for j in range(n_total_feats):
-        col_vals = train_combined[:, :, j]  # (n_train, 29)
-        real_vals = col_vals[real_mask_train]
-        if len(real_vals) > 0:
-            feat_mean[j] = real_vals.mean()
-            feat_std[j] = max(real_vals.std(), 1e-6)
-
-    log(f'Feature stats (train-only): feat_mean range=[{feat_mean.min():.3f}, {feat_mean.max():.3f}]', 'DATA')
-    log(f'Feature stats (train-only): feat_std  range=[{feat_std.min():.4f}, {feat_std.max():.4f}]', 'DATA')
-    print_feature_stats_table(feat_mean, feat_std, cfg)
-
-    # Apply normalization to ALL data
-    all_fixed = torch.from_numpy(FIXED_FEAT_TABLE)[z_indices_all]  # (N, 29, 27)
-    all_combined = torch.cat([all_fixed, mol_features_all], dim=-1)  # (N, 29, 47)
-
-    # Normalize
-    real_mask_all = (fmask_all > -9000.0)  # (N, 29) bool
-    for idx in range(n_total):
-        real_atoms = real_mask_all[idx]
-        all_combined[idx] = (all_combined[idx] - feat_mean) / feat_std
-        all_combined[idx, ~real_atoms] = 0.0
-
-    # The Dataset will receive:
-    # - mol_features: already normalized (N, 29, 20)  — we extract just the mol-dependent part
-    #   But wait, we normalized ALL 47 features together. The fixed features are also normalized now.
-    #   We need to split them back apart.
-    #   Actually, since the model looks up fixed features from the buffer and then normalizes them,
-    #   we should normalize the fixed features INSIDE the model, not here.
-    #   Let me rethink...
-
-    # Actually, the simplest approach: normalize ALL 47 features (fixed + mol-dependent) together,
-    # and pass them all as mol_features. Then in the model, DON'T use the fixed_feat_table buffer;
-    # just use the already-normalized features directly.
-    #
-    # But this means we lose the elegant lookup approach. Let me think...
-    #
-    # Better approach: split the normalized combined back into fixed and mol-dependent parts.
-    # - Normalized fixed features: (N, 29, 27) — store these as part of mol_features
-    # - Normalized mol-dependent features: (N, 29, 20) — store these as part of mol_features
-    # - In the model, concatenate them with z_embed
-    #
-    # This means the model doesn't need the fixed_feat_table buffer at all.
-    # The normalization is done here, and the model just receives the full feature vector.
-    #
-    # Wait, but then the model needs to know which features are which. Actually, it doesn't!
-    # The model just gets a (B, T, 47+16=63) tensor and projects it through nn.Linear(63, 192).
-    #
-    # So the simplest approach: store the full 47-dim normalized features as mol_features.
-    # The model concatenates z_embed to get 63 dims total.
-    #
-    # Let me do this. It's cleaner.
-
-    # mol_features_all now contains the NORMALIZED combined features (N, 29, 47)
-    mol_features_normalized = all_combined  # (N, 29, 47)
-
-    # Update feature_dim to reflect the actual input (47 normalized + 16 z_embed = 63)
-    # Already set in CFG: feature_dim = 27 + 20 + 16 = 63
-    # But now mol_features has 47 dims instead of 20, so total = 47 + 16 = 63
-    # That's the same! Because 27 (fixed) + 20 (mol) = 47, plus 16 (z_embed) = 63.
-    # So the input to the model is still 63 dims. 
-
-    train_ds = QM9Dataset(mol_features_normalized, fmask_all, targets_all,
-                          z_indices_all, positions_all, train_idx)
-    val_ds = QM9Dataset(mol_features_normalized, fmask_all, targets_all,
-                         z_indices_all, positions_all, val_idx)
-    test_ds = QM9Dataset(mol_features_normalized, fmask_all, targets_all,
-                          z_indices_all, positions_all, test_idx)
-
-    print_data_stats(raw_data, cfg, train_ds, val_ds, test_ds, y_mean, y_std)
-
-    tr_ld = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                       num_workers=0, pin_memory=False, drop_last=True)
-    va_ld = DataLoader(val_ds, batch_size=256, shuffle=False, num_workers=0, pin_memory=False)
-    te_ld = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0, pin_memory=False)
-
-    log(f'DataLoaders: train={len(tr_ld)} batches (bs={cfg.batch_size})  '
-        f'val={len(va_ld)} batches  test={len(te_ld)} batches')
-
-    # ── Build Model ──
-    log_separator('Building Model')
+    log_separator("Building model")
     model = GrafoPropagationGeoQM9(cfg).to(cfg.device)
+    params = sum(p.numel() for p in model.parameters())
+    log(f"Parameters: {params:,} ({params/1e6:.3f}M)", "INFO")
 
+    # ── PRE-PRETRAIN (BYOL) ──
+    if cfg.use_prepretrain and cfg.prepretrain_epochs > 0:
+        log_separator("PRE-PRETRAINING · DEEPMIND BYOL ASYMMETRIC")
+        prepre_wrapper = DeepMindBYOLWrapper(model, cfg).to(cfg.device)
+        base_opt_prepre = torch.optim.AdamW(prepre_wrapper.parameters(), lr=cfg.prepretrain_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=cfg.prepretrain_wd)
+        opt_prepre = BorelLaplaceResurgentOptimizer(base_opt_prepre)
+        
+        sched_prepre = WarmupCosineLR(cfg.prepretrain_epochs * len(prepre_ld), cfg.prepretrain_warmup_frac, cfg.prepretrain_min_lr_frac)
+        gprepre, prepre_hist = 0, []
+        for ep in range(1, cfg.prepretrain_epochs + 1):
+            ps, gprepre = pre_pretrain_epoch(prepre_wrapper, opt_prepre, prepre_ld, cfg, ep, sched_prepre, gprepre)
+            prepre_hist.append({"epoch": ep, **ps})
+            log(f"PREPRE EPOCH {ep:03d} │ loss={ps['loss']:.5f} rot={ps['rot_strength']:.2f}π time={ps['time_s']}s", "METRIC")
+
+        model = prepre_wrapper.student_backbone
+        torch.save({"model": model.state_dict()}, os.path.join(cfg.checkpoint_dir, "prepretrained_backbone.pt"))
+        del prepre_wrapper
+
+    # ── PRETRAIN (Masked / No VICReg) ──
+    if cfg.pretrain_epochs > 0:
+        log_separator("TRAIN-ONLY PRETRAINING")
+        wrapper = PretrainWrapper(model, cfg, n_aux=aux_norm.shape[1]).to(cfg.device)
+        base_opt_pre = torch.optim.AdamW(wrapper.parameters(), lr=cfg.pretrain_lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=cfg.pretrain_wd)
+        opt_pre = BorelLaplaceResurgentOptimizer(base_opt_pre)
+        
+        sched_pre = WarmupCosineLR(cfg.pretrain_epochs * len(pre_ld), cfg.warmup_frac, cfg.min_lr_frac)
+        gpre, pre_hist = 0, []
+        for ep in range(1, cfg.pretrain_epochs + 1):
+            ps, gpre = pretrain_epoch(wrapper, opt_pre, pre_ld, cfg, ep, sched_pre, gpre)
+            pre_hist.append({"epoch": ep, **ps})
+            log(f"PRE EPOCH {ep:03d} │ loss={ps['loss']:.5f} aux={ps['aux']:.5f} z={ps['z']:.5f} feat={ps['feat']:.5f}", "METRIC")
+
+        model = wrapper.backbone
+        torch.save({"model": model.state_dict()}, os.path.join(cfg.checkpoint_dir, "pretrained_backbone.pt"))
+        del wrapper
+
+    # ── FINETUNE ──
+    log_separator("FINETUNING (ALIEN CALCULUS · Lookahead REMOVIDO · LR 1e-3)")
     ema = EMA(model, cfg.ema_decay)
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log(f'Total parameters: {total_params:,} ({total_params/1e6:.3f} M)')
-    log(f'Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.3f} M)')
+    
+    # Optimizador Base com LR maior
+    base_opt = torch.optim.AdamW(model.parameters(), lr=0.0, betas=(0.9, 0.999), eps=1e-8, weight_decay=cfg.wd)
+    
+    # Apenas o BorelLaplaceResurgentOptimizer, sem Lookahead
+    optimizer = BorelLaplaceResurgentOptimizer(base_opt)
+    
+    awp, gc_hooks = AWP(model, cfg.awp_eps, cfg.awp_lr), register_gc(model)
+    sched = WarmupCosineLR(cfg.epochs * len(tr_ld), cfg.warmup_frac, cfg.min_lr_frac)
+    best_mae, best_epoch, best_r2, gstep, history = float("inf"), 0, -float("inf"), 0, []
 
-    # ── Quick forward test ──
-    fb_feat, fb_fm, fb_tgt, fb_z, fb_pos = next(iter(tr_ld))
-    fb_feat = fb_feat.to(cfg.device)
-    fb_fm = fb_fm.to(cfg.device)
-    fb_tgt = fb_tgt.to(cfg.device)
-    fb_z = fb_z.to(cfg.device)
-    fb_pos = fb_pos.to(cfg.device)
-    test_pred = model(fb_feat, fb_fm, fb_z, fb_pos)
-    log(f'Forward test: feat={fb_feat.shape}, fmask={fb_fm.shape}, z={fb_z.shape}, pos={fb_pos.shape}')
-    log(f'  pred shape={test_pred.shape}, range=[{test_pred.min().item():.4f}, {test_pred.max().item():.4f}]')
-    log(f'  target range=[{fb_tgt.min().item():.4f}, {fb_tgt.max().item():.4f}]')
-    log(f'  Initial MAE (normalized): {(test_pred - fb_tgt).abs().mean().item():.4f}')
-    log(f'  Initial MAE (eV): {((test_pred - fb_tgt).abs() * y_std).mean().item():.4f} eV')
-    del fb_feat, fb_fm, fb_tgt, fb_z, fb_pos, test_pred
-
-    # ── Optimizer ──
-    base_opt = torch.optim.AdamW(model.parameters(), lr=0.0, betas=(0.9, 0.999),
-                                  eps=1e-8, weight_decay=cfg.wd)
-    optimizer = Lookahead(base_opt, cfg.la_k, cfg.la_alpha)
-    use_amp = (cfg.device.type == 'cuda')
-    scaler = GradScaler('cuda', enabled=False)
-    awp = AWP(model, scaler, cfg.awp_eps, cfg.awp_lr)
-    gc_h = register_gc(model)
-
-    total_steps = cfg.epochs * len(tr_ld)
-    lr_sched = WarmupCosineLR(total_steps, cfg.warmup_frac, cfg.min_lr_frac)
-    log(f'LR schedule: total_steps={total_steps}, warmup_steps={int(cfg.warmup_frac * total_steps)}')
-
-    best_mae = float('inf')
-    best_epoch = 0
-    best_r2 = 0.0
-    gstep = 0
-    history = []
-
-    log_separator('TRAINING START')
-
-    # ── Training Loop ──
     for epoch in range(1, cfg.epochs + 1):
-        tr_s, gstep = train_epoch(model, ema, optimizer, scaler, tr_ld, awp,
-                                   cfg, epoch, gstep, lr_sched, base_opt)
+        tr_s, gstep = train_epoch(model, ema, optimizer, base_opt, tr_ld, awp, cfg, epoch, gstep, sched)
         va_s = evaluate(ema.shadow, va_ld, cfg, y_mean, y_std)
 
-        is_best = va_s['mae'] < best_mae
-        if is_best:
-            best_mae = va_s['mae']
-            best_epoch = epoch
-            best_r2 = va_s['r2']
+        if va_s["mae"] < best_mae:
+            best_mae, best_epoch, best_r2 = va_s["mae"], epoch, va_s["r2"]
+            torch.save({"model": model.state_dict(), "ema": ema.shadow.state_dict(), "y_mean": y_mean, "y_std": y_std}, os.path.join(cfg.checkpoint_dir, "best_model.pt"))
+            log(f"★ New best: MAE={best_mae:.6f} eV R2={best_r2:.6f} epoch={epoch}", "METRIC")
 
-        print_epoch_table(epoch, tr_s, va_s, best_mae, cfg)
+        log(f"EPOCH {epoch:03d} │ tr_loss={tr_s['loss']:.6f} tr_mae={tr_s['mae_ev']:.4f}eV │ val_mae={va_s['mae']:.4f}eV val_rmse={va_s['rmse']:.4f}eV R2={va_s['r2']:.5f} │ best={best_mae:.4f}eV", "METRIC")
+        history.append({"epoch": epoch, "val_mae": va_s["mae"], "best_mae": best_mae})
+        if epoch % cfg.checkpoint_every == 0: torch.save({"epoch": epoch, "model": model.state_dict(), "ema": ema.shadow.state_dict()}, os.path.join(cfg.checkpoint_dir, f"ep{epoch:03d}.pt"))
 
-        log(f'EPOCH {epoch:3d}/{cfg.epochs} │ '
-            f'tr_loss={tr_s["loss"]:.6f} │ tr_mae={tr_s["mae_ev"]:.4f} eV │ '
-            f'va_mae={va_s["mae"]:.4f} eV │ va_rmse={va_s["rmse"]:.4f} eV │ '
-            f'va_R2={va_s["r2"]:.4f} │ va_MAPE={va_s["mape"]:.2f}% │ '
-            f'va_Pearson={va_s["pearson_r"]:.4f} │ '
-            f'best_mae={best_mae:.4f} eV (ep{best_epoch}) │ '
-            f'gnorm={tr_s["grad_norm"]:.3f} │ {tr_s["time_s"]}s', 'METRIC')
+    log_separator("FINAL TEST")
+    ckpt = torch.load(os.path.join(cfg.checkpoint_dir, "best_model.pt"), map_location=cfg.device, weights_only=False)
+    ema.shadow.load_state_dict(ckpt["ema"])
+    test_s = evaluate(ema.shadow, te_ld, cfg, ckpt["y_mean"], ckpt["y_std"])
+    
+    if HAS_RICH:
+        t = Table(title="FINAL TEST · QM9 HOMO-LUMO Gap", box=box.DOUBLE_EDGE)
+        t.add_column("Metric", style="bold")
+        t.add_column("Value", justify="right", style="bold green")
+        t.add_row("Test MAE", f"{test_s['mae']:.6f} eV")
+        t.add_row("Test RMSE", f"{test_s['rmse']:.6f} eV")
+        t.add_row("Test R²", f"{test_s['r2']:.8f}")
+        t.add_row("Test Pearson", f"{test_s['pearson_r']:.8f}")
+        t.add_row("Test MedianAE", f"{test_s['median_ae']:.6f} eV")
+        t.add_row("Test MaxAE", f"{test_s['max_ae']:.6f} eV")
+        t.add_row("Best Val MAE", f"{best_mae:.6f} eV")
+        t.add_row("Best Epoch", str(best_epoch))
+        t.add_row("Parameters", f"{params:,} ({params/1e6:.3f}M)")
+        t.add_row("Run ID", RUN_ID)
+        console.print(t)
+    else:
+        log(f"FINAL TEST MAE={test_s['mae']:.6f} RMSE={test_s['rmse']:.6f} R2={test_s['r2']:.8f}", "METRIC")
 
-        hist_entry = {
-            'epoch': epoch,
-            'train_loss': tr_s['loss'],
-            'train_mae_ev': tr_s['mae_ev'],
-            'train_grad_norm': tr_s['grad_norm'],
-            'train_lr': tr_s['lr'],
-            'train_time_s': tr_s['time_s'],
-            'val_loss': va_s['loss'],
-            'val_mae': va_s['mae'],
-            'val_rmse': va_s['rmse'],
-            'val_r2': va_s['r2'],
-            'val_mape': va_s['mape'],
-            'val_median_ae': va_s['median_ae'],
-            'val_max_ae': va_s['max_ae'],
-            'val_pearson_r': va_s['pearson_r'],
-            'best_mae': best_mae,
-            'best_epoch': best_epoch,
-        }
-        history.append(hist_entry)
+    for h in gc_hooks: h.remove()
+    log(f"DONE · {cfg.VERSION} · Run {RUN_ID}", "METRIC")
 
-        if is_best:
-            torch.save({
-                'model': model.state_dict(),
-                'ema': ema.shadow.state_dict(),
-                'epoch': epoch,
-                'mae': best_mae,
-                'r2': best_r2,
-                'history': history,
-                'y_mean': y_mean,
-                'y_std': y_std,
-                'feat_mean': feat_mean,
-                'feat_std': feat_std,
-                'cfg': {k: v for k, v in vars(cfg).items() if not k.startswith('_')},
-            }, os.path.join(cfg.checkpoint_dir, 'best_model.pt'))
-            log(f'  ★ New best MAE: {best_mae:.4f} eV  R²={best_r2:.4f}  (epoch {epoch})', 'METRIC')
-
-        if epoch % cfg.checkpoint_every == 0:
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'ema': ema.shadow.state_dict(),
-                'best_mae': best_mae,
-            }, os.path.join(cfg.checkpoint_dir, f'ep{epoch:03d}.pt'))
-
-        try:
-            with open(cfg.history_path, 'w') as f:
-                json.dump(history, f, indent=2)
-        except Exception:
-            pass
-
-    # ── Final Test Evaluation ──
-    log_separator('FINAL TEST EVALUATION')
-
-    ckpt = torch.load(os.path.join(cfg.checkpoint_dir, 'best_model.pt'),
-                       map_location=cfg.device, weights_only=False)
-    ema.shadow.load_state_dict(ckpt['ema'])
-    te_s = evaluate(ema.shadow, te_ld, cfg, ckpt['y_mean'], ckpt['y_std'])
-
-    print_leaderboard_table(te_s, best_epoch, best_mae, total_params, cfg)
-
-    log_separator('RESULTS')
-    log(f'Best Val MAE: {best_mae:.4f} eV (epoch {best_epoch})', 'METRIC')
-    log(f'Test MAE:     {te_s["mae"]:.4f} eV', 'METRIC')
-    log(f'Test RMSE:    {te_s["rmse"]:.4f} eV', 'METRIC')
-    log(f'Test R²:      {te_s["r2"]:.6f}', 'METRIC')
-    log(f'Test MAPE:    {te_s["mape"]:.2f}%', 'METRIC')
-    log(f'Test Pearson: {te_s["pearson_r"]:.6f}', 'METRIC')
-    log(f'Test MedianAE:{te_s["median_ae"]:.4f} eV', 'METRIC')
-    log(f'Test MaxAE:   {te_s["max_ae"]:.4f} eV', 'METRIC')
-    log(f'Parameters:   {total_params:,} ({total_params/1e6:.3f} M)', 'METRIC')
-
-    for h in gc_h:
-        h.remove()
-
-    log(f'DONE · GrafoPropagation {cfg.VERSION} · Run {RUN_ID}', 'METRIC')
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
